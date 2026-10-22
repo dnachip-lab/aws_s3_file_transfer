@@ -364,6 +364,19 @@ python s3_move.py move --config config.json --src-user-id 000002 --dst-user-id 0
 ### ID の指定について
 
 - ユーザーID と Identity ID は **どちらか一方だけ指定すれば、もう一方を S3 から特定** します。一意に決まらない場合は中止するので、両方指定してください。
+- 同じユーザーID が複数の Identity ID 配下にある場合（例: テスト用の `test`）は、候補ごとの移動対象フォルダ数・最終アップロード日時と、指定すべきオプションを表示して中止します。
+
+  ```
+  エラー: 移動先のユーザーID test に該当するIdentity ID が 2 件あります。どれを使うか --dst-identity-id で指定してください。
+
+    1. Identity ID=ap-northeast-1:1e814f9d-d94a-4c4f-b33e-27855a8c0cc5
+       移動対象フォルダ checked: 3, unchecked: 0 / 最終アップロード 2025-06-10 10:00:00
+       指定方法: --dst-identity-id ap-northeast-1:1e814f9d-d94a-4c4f-b33e-27855a8c0cc5
+    2. Identity ID=ap-northeast-1:9082937f-99cd-cedf-7b3b-995dfe80cc79
+       ...
+  ```
+
+  候補は `search --user-id test` でも確認できます。どちらが正しいか分からない場合は、アプリ側（Cognito）で対象ユーザーの Identity ID を確認してください。
 - ユーザーID だけを指定した場合は `private/` 配下の全 Identity ID を走査して探すため、Identity ID の数が多いと時間がかかります。
 
 ### オプション

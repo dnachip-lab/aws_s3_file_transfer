@@ -110,7 +110,7 @@ def test_identity_id_only(env):
 
 def test_identity_with_multiple_users_requires_user_id(env):
     s3, config, _ = env
-    with pytest.raises(s3_move.MoveError, match="該当するユーザーIDが複数あります"):
+    with pytest.raises(s3_move.MoveError, match="該当するユーザーID が 2 件あります"):
         run(s3, config, ["move", "--src-user-id", "000002", "--dst-identity-id", ID_C])
 
 
@@ -205,7 +205,7 @@ def test_search_by_user_id(env):
     assert code == 0
     assert "1 件見つかりました" in out
     assert ID_A in out
-    assert "checked: 2, unchecked: 1" in out
+    assert "移動対象フォルダ checked: 2, unchecked: 1 / 最終アップロード " in out
 
 
 def test_search_by_identity_id_lists_all_users(env):
@@ -490,3 +490,21 @@ def test_list_empty_result_explains_period(env):
 def test_table_header_alignment():
     assert s3_move.display_width("状態") == 4
     assert s3_move.ljust("状態", 9) == "状態     "
+
+
+def test_ambiguous_user_id_lists_candidates(env):
+    s3, config, _ = env
+    s3.put_object(Bucket=BUCKET, Key=f"private/{ID_C}/000003/unchecked/Z/a.csv", Body=b"x")
+    with pytest.raises(s3_move.MoveError) as ei:
+        run(s3, config, ["move", "--src-user-id", "000002", "--dst-user-id", "000003"])
+    msg = str(ei.value)
+    assert "Identity ID が 2 件あります" in msg
+    assert f"--dst-identity-id {ID_B}" in msg
+    assert f"--dst-identity-id {ID_C}" in msg
+    assert "移動対象フォルダ checked: 1, unchecked: 1" in msg  # ID_B 側
+    assert "移動対象フォルダ checked: 0, unchecked: 1" in msg  # ID_C 側
+    # Identity ID を指定すれば進める
+    code, out = run(s3, config, ["move", "--src-user-id", "000002", "--dst-user-id", "000003",
+                                 "--dst-identity-id", ID_C, "--dry-run"])
+    assert code == 0, out
+    assert f"private/{ID_C}/000003/checked/SAT0202301/" in out

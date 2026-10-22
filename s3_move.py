@@ -222,6 +222,17 @@ def find_owners(s3, bucket, config, user_id=None, identity_id=None):
             if prefix_exists(s3, bucket, f"{root}{ident}/{user_id}/")]
 
 
+OPTION_PREFIX = {"移動元": "--src-", "移動先": "--dst-", "対象": "--"}
+
+
+def owner_summary(s3, bucket, config, owner):
+    """持ち主の移動対象フォルダ数 (checked / unchecked) と最終アップロード日時。"""
+    folders = collect_folders(s3, bucket, config, owner, STATUSES)
+    counts = ", ".join(f"{st}: {sum(f.status == st for f in folders)}" for st in STATUSES)
+    last = max((f.last_uploaded for f in folders), default=None)
+    return f"移動対象フォルダ {counts} / 最終アップロード {format_dt(last, config['tz']) or 'なし'}"
+
+
 def resolve_owner(s3, bucket, config, label, user_id, identity_id, out):
     """ユーザーID / Identity ID から持ち主を 1 つに特定する。一意に決まらなければ中止。"""
     if user_id and identity_id:
@@ -234,10 +245,15 @@ def resolve_owner(s3, bucket, config, label, user_id, identity_id, out):
         raise MoveError(f"{label}の{given} が見つかりません")
     if len(matches) > 1:
         other = "Identity ID" if user_id else "ユーザーID"
-        found = ", ".join(m.identity_id if user_id else m.user_id for m in matches)
-        raise MoveError(
-            f"{label}の{given} に該当する{other}が複数あります: {found}\n"
-            f"{other}も指定してください。")
+        option = OPTION_PREFIX.get(label, "--") + ("identity-id" if user_id else "user-id")
+        lines = [f"{label}の{given} に該当する{other} が {len(matches)} 件あります。"
+                 f"どれを使うか {option} で指定してください。", ""]
+        for i, m in enumerate(matches, 1):
+            value = m.identity_id if user_id else m.user_id
+            lines.append(f"  {i}. {other}={value}")
+            lines.append(f"     {owner_summary(s3, bucket, config, m)}")
+            lines.append(f"     指定方法: {option} {value}")
+        raise MoveError("\n".join(lines))
     owner = matches[0]
     if user_id:
         print(f"{label}の Identity ID を特定しました: {owner.identity_id}", file=out)
@@ -515,12 +531,8 @@ def cmd_search(args, config, s3, bucket, input_func, out):
         return 1
     print(f"{len(owners)} 件見つかりました:", file=out)
     for o in owners:
-        counts = []
-        for st in STATUSES:
-            n = len(collect_folders(s3, bucket, config, o, (st,)))
-            counts.append(f"{st}: {n}")
-        print(f"  ユーザーID={o.user_id}  Identity ID={o.identity_id}  "
-              f"(移動対象フォルダ {', '.join(counts)})", file=out)
+        print(f"  ユーザーID={o.user_id}  Identity ID={o.identity_id}", file=out)
+        print(f"    {owner_summary(s3, bucket, config, o)}", file=out)
         print(f"    {owner_prefix(config, o)}", file=out)
     return 0
 
