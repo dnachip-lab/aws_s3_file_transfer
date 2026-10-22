@@ -27,6 +27,7 @@ move の安全方針:
 
 import argparse
 import csv
+import fnmatch
 import datetime
 import json
 import os
@@ -252,12 +253,36 @@ def load_folder(s3, bucket, config, owner, status, name):
                         objects=list_objects(s3, bucket, prefix))
 
 
-def collect_folders(s3, bucket, config, owner, statuses, folder_names=None):
+def split_names(values):
+    """--folder / --name の値 (複数指定・カンマ区切り可) を平坦なリストにする。"""
+    return [v.strip() for value in (values or []) for v in value.split(",") if v.strip()]
+
+
+def name_matches(name, folders=None, patterns=None):
+    """フォルダ名の条件: --folder (完全一致) と --name (ワイルドカード、大文字小文字を区別しない)
+    のどれかに一致すれば対象。どちらも未指定なら全件対象。"""
+    if not folders and not patterns:
+        return True
+    if folders and name in folders:
+        return True
+    return any(fnmatch.fnmatchcase(name.lower(), p.lower()) for p in patterns or [])
+
+
+def name_filter_text(args):
+    parts = []
+    if args.folders:
+        parts.append("フォルダ名 " + ", ".join(args.folders))
+    if args.names:
+        parts.append("パターン " + ", ".join(args.names))
+    return " または ".join(parts) if parts else "指定なし"
+
+
+def collect_folders(s3, bucket, config, owner, statuses, folder_names=None, patterns=None):
     """移動対象となる結果フォルダ (PDF / CSV を含むもの) を返す。"""
     folders = []
     for status in statuses:
         for name in list_subfolders(s3, bucket, status_prefix(config, owner, status)):
-            if folder_names and name not in folder_names:
+            if not name_matches(name, folder_names, patterns):
                 continue
             folder = load_folder(s3, bucket, config, owner, status, name)
             if folder.has_targets(config["expected_extensions"]):
@@ -513,13 +538,18 @@ def cmd_list(args, config, s3, bucket, input_func, out):
     user_id, identity_id = validated_ids(config, args.user_id, args.identity_id)
     owner = resolve_owner(s3, bucket, config, "対象", user_id, identity_id, out)
     statuses = STATUSES if args.status == "both" else (args.status,)
-    folders = filter_period(collect_folders(s3, bucket, config, owner, statuses), args, config)
-    folders = sort_folders(folders, args.sort)
+    folders = collect_folders(s3, bucket, config, owner, statuses, args.folders, args.names)
+    missing = sorted(set(args.folders or []) - {f.name for f in folders})
+    folders = sort_folders(filter_period(folders, args, config), args.sort)
 
     print(f"対象     : {owner}", file=out)
     print(f"フォルダ : {', '.join(statuses)}", file=out)
+    print(f"フォルダ名: {name_filter_text(args)}", file=out)
     print(f"期間     : {period_text(args)}", file=out)
     print("", file=out)
+    if missing:
+        print(f"※注意: 指定されたフォルダが見つかりません (PDF/CSV を含むもの): {', '.join(missing)}",
+              file=out)
     if not folders:
         print("該当する結果フォルダはありません。", file=out)
         return 0
@@ -562,6 +592,7 @@ def cmd_move(args, config, s3, bucket, input_func, out):
     print(f"移動先   : {dst}", file=out)
     if not args.list:
         print(f"対象     : {', '.join(statuses)}", file=out)
+        print(f"フォルダ名: {name_filter_text(args)}", file=out)
         print(f"期間     : {period_text(args)}", file=out)
     print("", file=out)
 
@@ -590,7 +621,7 @@ def cmd_move(args, config, s3, bucket, input_func, out):
                                   f"({expected_count} → {len(folder.objects)})")
             plan.append(folder)
     else:
-        plan = collect_folders(s3, bucket, config, src, statuses, args.folders)
+        plan = collect_folders(s3, bucket, config, src, statuses, args.folders, args.names)
         if args.folders:
             missing = sorted(set(args.folders) - {f.name for f in plan})
             if missing:
@@ -728,6 +759,12 @@ def parse_args(argv):
                         help="対象フォルダ (checked / unchecked / both、既定: both)")
     period.add_argument("--since", type=parse_date, help="アップロード日がこの日以降 (YYYY-MM-DD)")
     period.add_argument("--until", type=parse_date, help="アップロード日がこの日以前 (YYYY-MM-DD)")
+    period.add_argument("--folder", action="append", dest="folders",
+                        help="結果フォルダ名で絞り込む (完全一致。例: SAT0202301。"
+                             "複数指定・カンマ区切り可)")
+    period.add_argument("--name", action="append", dest="names",
+                        help="結果フォルダ名をワイルドカードで絞り込む (* は任意の文字列、? は任意の 1 文字。"
+                             "例: 'SAT2026*'。複数指定可。大文字小文字は区別しない)")
     period.add_argument("--date-basis", choices=("last", "first"), default="last",
                         help="期間判定に使う日付: フォルダ内の最終 (last) / 最初 (first) のアップロード日 "
                              "(既定: last)")
@@ -755,8 +792,6 @@ def parse_args(argv):
     mp.add_argument("--src-identity-id", help="移動元の Identity ID")
     mp.add_argument("--dst-user-id", help="移動先のユーザーID")
     mp.add_argument("--dst-identity-id", help="移動先の Identity ID")
-    mp.add_argument("--folder", action="append", dest="folders",
-                    help="対象の結果フォルダ名 (例: SAT0202301。複数指定可。省略時は一覧から選択)")
     mp.add_argument("--list", help="list -o で保存した一覧 CSV に含まれるフォルダを一括移動する")
     mp.add_argument("--allow-new-destination", action="store_true",
                     help="移動先のフォルダが存在しなくても続行する (通常は使わないこと)")
@@ -767,13 +802,17 @@ def parse_args(argv):
                       help="実際に移動する。省略時はドライラン")
 
     args = p.parse_args(argv)
+    if hasattr(args, "folders"):
+        args.folders = split_names(args.folders)
+        args.names = split_names(args.names)
     if args.command in ("search", "list") and not (args.user_id or args.identity_id):
         p.error("--user-id か --identity-id の少なくとも一方を指定してください")
     if args.command == "move":
         if not (args.dst_user_id or args.dst_identity_id):
             p.error("--dst-user-id か --dst-identity-id の少なくとも一方を指定してください")
-        if args.list and (args.folders or args.since or args.until or args.status != "both"):
-            p.error("--list と --folder / --since / --until / --status は同時に指定できません")
+        if args.list and (args.folders or args.names or args.since or args.until
+                          or args.status != "both"):
+            p.error("--list と --folder / --name / --since / --until / --status は同時に指定できません")
     if getattr(args, "since", None) and getattr(args, "until", None) and args.since > args.until:
         p.error("--since は --until 以前の日付を指定してください")
     return args

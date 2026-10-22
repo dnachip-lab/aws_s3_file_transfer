@@ -415,3 +415,57 @@ def test_list_sort_and_date_summary(env):
     assert "最終アップロード日の範囲: 2026-08-20 〜 2026-10-01" in out
     assert "2026-08: 1, 2026-09: 1, 2026-10: 1" in out
     assert "--since YYYY-MM-DD" in out
+
+
+def list_csv_folders(path):
+    with open(path, encoding="utf-8-sig") as f:
+        return [(r["status"], r["folder"]) for r in csv.DictReader(f)]
+
+
+def test_list_filter_by_folder_names_and_save(env):
+    s3, config, tmp = env
+    path = tmp / "list.csv"
+    code, out = run(s3, config, ["list", "--user-id", "000002",
+                                 "--folder", "SAT0202301,SAT0202303", "-o", str(path)])
+    assert code == 0, out
+    assert "フォルダ名: フォルダ名 SAT0202301, SAT0202303" in out
+    assert list_csv_folders(path) == [("checked", "SAT0202301"), ("unchecked", "SAT0202303")]
+
+
+def test_list_filter_by_wildcard(env):
+    s3, config, tmp = env
+    path = tmp / "list.csv"
+    code, out = run(s3, config, ["list", "--user-id", "000002", "--name", "sat020230[12]",
+                                 "--status", "checked", "-o", str(path)])
+    assert code == 0, out
+    assert list_csv_folders(path) == [("checked", "SAT0202301"), ("checked", "SAT0202302")]
+
+
+def test_list_folder_and_pattern_are_or(env):
+    s3, config, tmp = env
+    path = tmp / "list.csv"
+    run(s3, config, ["list", "--user-id", "000002", "--folder", "SAT0202303",
+                     "--name", "*01", "-o", str(path)])
+    assert list_csv_folders(path) == [("checked", "SAT0202301"), ("unchecked", "SAT0202303")]
+
+
+def test_list_missing_folder_warns(env):
+    s3, config, _ = env
+    code, out = run(s3, config, ["list", "--user-id", "000002", "--folder", "NOPE"])
+    assert code == 0
+    assert "指定されたフォルダが見つかりません" in out and "NOPE" in out
+
+
+def test_move_with_wildcard(env):
+    s3, config, _ = env
+    code, out = run(s3, config, BASE + ["--name", "*2303", "--execute"], ["all"] + CONFIRM)
+    assert code == 0, out
+    k = keys(s3)
+    assert f"private/{ID_B}/000003/unchecked/SAT0202303/data.csv" in k
+    assert f"private/{ID_A}/000002/checked/SAT0202301/report.pdf" in k
+
+
+def test_list_option_conflicts_with_name(env):
+    s3, config, tmp = env
+    with pytest.raises(SystemExit):
+        run(s3, config, ["move", "--list", "x.csv", "--dst-user-id", "000003", "--name", "SAT*"])

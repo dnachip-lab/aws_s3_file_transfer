@@ -193,8 +193,14 @@ python s3_move.py search --config config.json --user-id 000003
 #    一覧の下に「最終アップロード日の範囲」と「月別フォルダ数」が出るので、移動する期間を決める
 python s3_move.py list --config config.json --user-id 000002 --sort last
 
-# ③ 決めた期間で絞り込み、一覧を CSV に保存 (必要に応じて --status checked / unchecked も指定)
+# ③ 移動するフォルダを絞り込み、一覧を CSV に保存 (S3 は変更しない)
+#    絞り込み条件は組み合わせ可能 (下の「絞り込み条件」を参照)
+#    例1: 期間で絞り込む
 python s3_move.py list --config config.json --user-id 000002 --since 2026-10-01 --until 2026-10-31 -o list_000002.csv
+#    例2: フォルダ名を指定する
+python s3_move.py list --config config.json --user-id 000002 --folder SAT0202301,SAT0202303 -o list_000002.csv
+#    例3: フォルダ名のパターン + checked のみ
+python s3_move.py list --config config.json --user-id 000002 --name 'SAT2026*' --status checked -o list_000002.csv
 
 # ④ list_000002.csv を Excel 等で開き、移動しない行を削除して保存
 
@@ -255,7 +261,7 @@ python s3_move.py search --config config.json --identity-id ap-northeast-1:05efd
     private/ap-northeast-1:05efdd85-9e44-4765-90e4-d8a9138bb7da/000002/
 ```
 
-### list: 移動対象フォルダの一覧（期間指定・CSV 保存）
+### list: 移動対象フォルダの一覧（期間・フォルダ名で絞り込み、CSV 保存）
 
 ```bash
 # 2026年10月にアップロードされた checked の結果フォルダを一覧表示し、CSV に保存
@@ -276,6 +282,21 @@ python s3_move.py list --config config.json --user-id 000002 --status checked \
 月別フォルダ数 (最終アップロード日): 2026-10: 1
 一覧を保存しました: list.csv
 ```
+
+#### 絞り込み条件
+
+| オプション | 内容 | 例 |
+| --- | --- | --- |
+| `--status` | `checked` / `unchecked` / `both`（既定） | `--status checked` |
+| `--folder` | フォルダ名（完全一致）。複数指定・カンマ区切り可 | `--folder SAT0202301,SAT0202303` |
+| `--name` | フォルダ名のパターン。`*` は任意の文字列、`?` は任意の 1 文字、`[12]` は 1 か 2。大文字小文字は区別しない。複数指定可 | `--name 'SAT2026*'` |
+| `--since` / `--until` | アップロード日の期間（両端を含む） | `--since 2026-10-01 --until 2026-10-31` |
+
+- 種類の違う条件（`--status`・フォルダ名・期間）は **すべて満たす** ものが対象です。
+- `--folder` と `--name` を両方指定した場合は、**どちらかに一致** するものが対象です。
+- `--name` のパターンは `'SAT2026*'` のように **引用符で囲んで** ください（囲まないと bash が `*` を先に展開してしまうことがあります）。
+- `--folder` で指定したフォルダが見つからない場合は注意を表示します。
+- `move` でも同じ条件で絞り込めます（`--list` との併用は不可）。
 
 - アップロード日はフォルダ内ファイルの S3 最終更新日時です。期間判定は既定でフォルダ内の **最終** アップロード日を使います（`--date-basis first` で最初のアップロード日）。
 - 保存した CSV（Excel で開けます）の列: `identity_id, user_id, status, folder, pdf_count, csv_count, other_count, file_count, total_size, first_uploaded, last_uploaded`
@@ -359,8 +380,9 @@ python s3_move.py move --config config.json --src-user-id 000002 --dst-user-id 0
 | `--date-basis` | | ✓ | ✓ | 期間判定に使う日付 `last`（最終、既定）/ `first`（最初） |
 | `-o`, `--output` | | ✓ | | 一覧を CSV に保存 |
 | `--sort` | | ✓ | | 並び順 `name`（既定）/ `last`（最終アップロード日順）/ `first`（最初のアップロード日順） |
-| `--folder NAME` | | | ✓ | 対象の結果フォルダ名（複数指定可） |
-| `--list FILE` | | | ✓ | 一覧 CSV のフォルダを一括移動（`--folder` / `--since` / `--until` / `--status` とは併用不可） |
+| `--folder NAME` | | ✓ | ✓ | フォルダ名で絞り込み（完全一致。複数指定・カンマ区切り可） |
+| `--name PATTERN` | | ✓ | ✓ | フォルダ名をワイルドカードで絞り込み（例: `'SAT2026*'`） |
+| `--list FILE` | | | ✓ | 一覧 CSV のフォルダを一括移動（`--folder` / `--name` / `--since` / `--until` / `--status` とは併用不可） |
 | `--dry-run` | | | ✓ | ドライラン（既定）。S3 を変更せず移動予定ファイルの一覧とレポートを出力 |
 | `--execute` | | | ✓ | 実際に移動する（`--dry-run` とは併用不可） |
 | `--allow-new-destination` | | | ✓ | 移動先のフォルダが存在しなくても続行 |
