@@ -55,6 +55,21 @@ search で ID を確認 → list で一覧 CSV を作成 → CSV から不要な
 
 ### 2. ツールを取得して Python の仮想環境を作る
 
+> 使っている端末に合わせてどちらか一方を実行します。
+> プロンプトが `ユーザー名@PC名:~$` の形なら **WSL / Linux / Mac**、`PS C:\...>` の形なら **Windows PowerShell** です。
+
+WSL / Linux / Mac（bash）:
+
+```bash
+git clone https://github.com/dnachip-lab/aws_s3_file_transfer.git
+cd aws_s3_file_transfer
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+> WSL / Ubuntu で `python3 -m venv` が失敗する場合は、先に `sudo apt install python3-venv` を実行してください。
+
 Windows（PowerShell）:
 
 ```powershell
@@ -67,16 +82,6 @@ pip install -r requirements.txt
 
 > `Activate.ps1` 実行時に「スクリプトの実行が無効」と出る場合は、一度だけ
 > `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` を実行してください。
-
-Mac / Linux:
-
-```bash
-git clone https://github.com/dnachip-lab/aws_s3_file_transfer.git
-cd aws_s3_file_transfer
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
 
 ### 3. AWS の認証情報を設定する
 
@@ -125,7 +130,7 @@ aws sts get-caller-identity --profile dcr_iijima_dev
 ### 4. 設定ファイルを作る
 
 ```bash
-cp config.example.json config.json        # Windows: copy config.example.json config.json
+cp config.example.json config.json        # Windows PowerShell の場合: copy config.example.json config.json
 ```
 
 `config.json` を開き、バケット名を対象環境（テスト / 本番）に合わせて編集します。
@@ -166,8 +171,8 @@ python s3_move.py search --config config.json --user-id 000002
 ### 1. 準備
 
 ```bash
-cd aws_s3_file_transfer
-.venv\Scripts\Activate.ps1                 # Mac / Linux: source .venv/bin/activate
+cd ~/aws_s3_file_transfer
+source .venv/bin/activate                   # Windows PowerShell の場合: .venv\Scripts\Activate.ps1
 git pull                                    # ツールを最新にする
 pip install -r requirements.txt             # 更新があった場合に依存関係を反映
 aws sts get-caller-identity --profile dcr_iijima_dev   # 認証が有効か確認 (SSO は期限切れなら aws sso login --profile dcr_iijima_dev)
