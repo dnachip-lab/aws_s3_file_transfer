@@ -469,3 +469,24 @@ def test_list_option_conflicts_with_name(env):
     s3, config, tmp = env
     with pytest.raises(SystemExit):
         run(s3, config, ["move", "--list", "x.csv", "--dst-user-id", "000003", "--name", "SAT*"])
+
+
+def test_list_empty_result_explains_status(env):
+    s3, config, _ = env
+    code, out = run(s3, config, ["list", "--user-id", "000002", "--name", "*2303", "--status", "checked"])
+    assert code == 0
+    assert "該当する結果フォルダはありません" in out
+    assert "フォルダ名の条件だけで絞り込んだ場合: 1 件 (checked: 0, unchecked: 1)" in out
+    assert "--status の指定を見直してください" in out
+
+
+def test_list_empty_result_explains_period(env):
+    s3, config, _ = env
+    code, out = run(s3, config, ["list", "--user-id", "000002", "--until", YESTERDAY.isoformat()])
+    assert "絞り込みなしの場合: 3 件 (checked: 2, unchecked: 1)" in out
+    assert "期間の指定を見直してください" in out
+
+
+def test_table_header_alignment():
+    assert s3_move.display_width("状態") == 4
+    assert s3_move.ljust("状態", 9) == "状態     "

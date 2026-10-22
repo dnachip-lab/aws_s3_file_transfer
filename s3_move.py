@@ -33,6 +33,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass, field
 
 STATUSES = ("checked", "unchecked")
@@ -371,11 +372,25 @@ def read_list_csv(path, config):
 
 # ---------------------------------------------------------------- 表示
 
+def display_width(text):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+
+
+def ljust(text, width):
+    """全角文字を 2 桁として左詰めする。"""
+    return text + " " * max(width - display_width(text), 0)
+
+
+def rjust(text, width):
+    return " " * max(width - display_width(text), 0) + text
+
+
 def print_folder_table(folders, config, out):
     exts = config["expected_extensions"]
     tz = config["tz"]
-    print(f"  {'No':>4}  {'状態':<9} {'結果フォルダ':<20} {'PDF':>4} {'CSV':>4} {'他':>3} "
-          f"{'サイズ':>9}  {'最初のアップロード':<19}  {'最終アップロード':<19}", file=out)
+    print(f"  {'No':>4}  {ljust('状態', 9)} {ljust('結果フォルダ', 20)} {'PDF':>4} {'CSV':>4} "
+          f"{rjust('他', 3)} {rjust('サイズ', 9)}  {ljust('最初のアップロード', 19)}  "
+          f"{ljust('最終アップロード', 19)}".rstrip(), file=out)
     for i, f in enumerate(folders, 1):
         print(f"  {i:>4}. {f.status:<9} {f.name:<20} {f.count_of('.pdf'):>4} {f.count_of('.csv'):>4} "
               f"{f.other_count(exts):>3} {format_size(f.total_size):>9}  "
@@ -534,6 +549,27 @@ def print_date_summary(folders, args, config, out):
           ", ".join(f"{m}: {n}" for m, n in sorted(months.items())), file=out)
 
 
+def print_empty_hint(s3, bucket, config, owner, args, out):
+    """絞り込みで 0 件になったとき、どの条件で外れたかの目安を表示する。"""
+    every = collect_folders(s3, bucket, config, owner, STATUSES)
+    if not every:
+        print("  (このユーザーには PDF/CSV を含む結果フォルダがありません)", file=out)
+        return
+    by_name = [f for f in every if name_matches(f.name, args.folders, args.names)]
+    counts = ", ".join(f"{st}: {sum(f.status == st for f in by_name)}" for st in STATUSES)
+    if args.folders or args.names:
+        print(f"  フォルダ名の条件だけで絞り込んだ場合: {len(by_name)} 件 ({counts})", file=out)
+    else:
+        print(f"  絞り込みなしの場合: {len(every)} 件 ({counts})", file=out)
+    if by_name and args.status != "both":
+        print("  --status の指定を見直してください (both にすると checked / unchecked の両方が対象)。",
+              file=out)
+    elif by_name and (args.since or args.until):
+        dates = [basis_date(f, args.date_basis, config["tz"]) for f in by_name]
+        print(f"  期間の指定を見直してください (該当フォルダのアップロード日: {min(dates)} 〜 {max(dates)})。",
+              file=out)
+
+
 def cmd_list(args, config, s3, bucket, input_func, out):
     user_id, identity_id = validated_ids(config, args.user_id, args.identity_id)
     owner = resolve_owner(s3, bucket, config, "対象", user_id, identity_id, out)
@@ -552,6 +588,7 @@ def cmd_list(args, config, s3, bucket, input_func, out):
               file=out)
     if not folders:
         print("該当する結果フォルダはありません。", file=out)
+        print_empty_hint(s3, bucket, config, owner, args, out)
         return 0
     print_folder_table(folders, config, out)
     print("", file=out)
