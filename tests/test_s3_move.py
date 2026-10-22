@@ -651,3 +651,48 @@ def test_undo_does_not_overwrite_existing_original(env):
     body = s3.get_object(Bucket=BUCKET, Key=f"private/{ID_A}/000002/checked/SAT0202301/report.pdf")["Body"].read()
     assert body == b"new"
     assert f"private/{ID_A}/000002/checked/SAT0202301/data.csv" in keys(s3)
+
+
+MISMATCH_DST = ["--dst-identity-id", ID_A, "--dst-user-id", "000003"]
+
+
+def test_mismatch_error_mentions_opt_in_flag(env):
+    s3, config, _ = env
+    with pytest.raises(s3_move.MoveError, match="--allow-id-mismatch"):
+        run(s3, config, ["move", "--src-user-id", "000002"] + MISMATCH_DST + ["--dry-run"])
+
+
+def test_mismatch_allowed_dry_run_warns_only(env):
+    s3, config, _ = env
+    before = keys(s3)
+    code, out = run(s3, config, ["move", "--src-user-id", "000002"] + MISMATCH_DST
+                    + ["--allow-id-mismatch", "--dry-run"])
+    assert code == 0, out
+    assert "組み合わせが一致しません" in out and "続行します" in out
+    assert f"private/{ID_A}/000003/checked/SAT0202301/" in out
+    assert keys(s3) == before
+
+
+def test_mismatch_allowed_requires_create(env):
+    s3, config, _ = env
+    before = keys(s3)
+    # yes では作成しない (create の入力が必要)
+    code, out = run(s3, config, ["move", "--src-user-id", "000002"] + MISMATCH_DST
+                    + ["--allow-id-mismatch", "--allow-new-destination", "--execute"], ["yes"])
+    assert code == 1
+    assert keys(s3) == before
+
+
+def test_mismatch_allowed_creates_temp_user_folder(env):
+    s3, config, tmp = env
+    code, out = run(s3, config, ["move", "--src-user-id", "000002"] + MISMATCH_DST
+                    + ["--folder", "SAT0202301", "--allow-id-mismatch", "--execute"],
+                    ["create", "all", "000003", ID_A, "yes"])
+    assert code == 0, out
+    assert "別の Identity ID 配下にもあります" in out
+    k = keys(s3)
+    assert f"private/{ID_A}/000003/checked/SAT0202301/report.pdf" in k
+    assert f"private/{ID_A}/000002/checked/SAT0202301/report.pdf" not in k
+    assert f"private/{ID_B}/000003/checked/SAT0202302/report.pdf" in k  # 本来の 000003 は無関係
+    log = json.loads(open(latest_log(tmp, "move")).read())
+    assert log["meta"]["id_mismatch_acknowledged_with"] == [ID_B]

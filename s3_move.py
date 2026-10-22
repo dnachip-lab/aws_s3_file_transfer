@@ -232,32 +232,45 @@ def owner_summary(s3, bucket, config, owner):
     return f"移動対象フォルダ {counts} / 最終アップロード {format_dt(last, config['tz']) or 'なし'}"
 
 
-def check_pair_mismatch(s3, bucket, config, label, owner, out):
+def check_pair_mismatch(s3, bucket, config, label, owner, out, allow=False):
     """指定されたユーザーID と Identity ID の組が S3 に無いとき、そのユーザーID が別の Identity ID
-    配下に存在すれば組み合わせの誤りとして中止する。"""
+    配下に存在すれば組み合わせの誤りとして中止する。allow=True (意図的な仮フォルダ作成) なら
+    警告を表示して、同名ユーザーID のある持ち主の一覧を返す。"""
     print(f"{label}のユーザーID {owner.user_id} が他の Identity ID 配下にないか確認しています...", file=out)
     others = [o for o in find_owners(s3, bucket, config, owner.user_id) if o != owner]
-    if others:
-        option = OPTION_PREFIX.get(label, "--") + "identity-id"
-        lines = [f"{label}のユーザーID {owner.user_id} と Identity ID {owner.identity_id} の組み合わせが"
-                 "一致しません。",
-                 f"  ユーザーID {owner.user_id} は次の Identity ID 配下にあります:"]
-        for o in others:
-            lines.append(f"    {option} {o.identity_id}")
-            lines.append(f"      {owner_summary(s3, bucket, config, o)}")
-        users = list_subfolders(s3, bucket, f"{config['root_prefix']}{owner.identity_id}/")
-        if users:
-            lines.append(f"  指定した Identity ID 配下のユーザーID: {', '.join(users[:20])}")
-        lines.append("ユーザーID と Identity ID の組み合わせを確認してください。")
-        raise MoveError("\n".join(lines))
+    if not others:
+        return []
+    option = OPTION_PREFIX.get(label, "--") + "identity-id"
+    lines = [f"{label}のユーザーID {owner.user_id} と Identity ID {owner.identity_id} の組み合わせが"
+             "一致しません。",
+             f"  ユーザーID {owner.user_id} は次の Identity ID 配下にあります:"]
+    for o in others:
+        lines.append(f"    {option} {o.identity_id}")
+        lines.append(f"      {owner_summary(s3, bucket, config, o)}")
+    users = list_subfolders(s3, bucket, f"{config['root_prefix']}{owner.identity_id}/")
+    if users:
+        lines.append(f"  指定した Identity ID 配下のユーザーID: {', '.join(users[:20])}")
+    if allow:
+        print("※警告: " + "\n".join(lines), file=out)
+        print(f"  --allow-id-mismatch が指定されているため、指定した Identity ID 配下に "
+              f"ユーザーID {owner.user_id} のフォルダを新規作成する前提で続行します。", file=out)
+        return others
+    lines.append("ユーザーID と Identity ID の組み合わせを確認してください。")
+    lines.append("意図的にこの組み合わせ (仮のユーザーID など) でフォルダを作成する場合は、"
+                 "--allow-id-mismatch を付けて実行してください (実行時に確認があります)。")
+    raise MoveError("\n".join(lines))
 
 
-def resolve_owner(s3, bucket, config, label, user_id, identity_id, out):
-    """ユーザーID / Identity ID から持ち主を 1 つに特定する。一意に決まらなければ中止。"""
+def resolve_owner(s3, bucket, config, label, user_id, identity_id, out,
+                  allow_mismatch=False, notes=None):
+    """ユーザーID / Identity ID から持ち主を 1 つに特定する。一意に決まらなければ中止。
+    notes を渡すと、組み合わせ不一致を許可した場合に notes["mismatch"] へ同名ユーザーID の持ち主を入れる。"""
     if user_id and identity_id:
         owner = Owner(identity_id, user_id)
         if not prefix_exists(s3, bucket, owner_prefix(config, owner)):
-            check_pair_mismatch(s3, bucket, config, label, owner, out)
+            others = check_pair_mismatch(s3, bucket, config, label, owner, out, allow_mismatch)
+            if notes is not None and others:
+                notes["mismatch"] = others
         return owner
     if user_id:
         print(f"{label}のユーザーID {user_id} の Identity ID を検索しています...", file=out)
@@ -822,7 +835,10 @@ def cmd_move(args, config, s3, bucket, input_func, out):
         if not (src_user or src_ident):
             raise MoveError("--src-user-id か --src-identity-id、または --list を指定してください")
         src = resolve_owner(s3, bucket, config, "移動元", src_user, src_ident, out)
-    dst = resolve_owner(s3, bucket, config, "移動先", dst_user, dst_ident, out)
+    notes = {}
+    dst = resolve_owner(s3, bucket, config, "移動先", dst_user, dst_ident, out,
+                        allow_mismatch=args.allow_id_mismatch, notes=notes)
+    mismatch = notes.get("mismatch", [])
 
     print(f"移動元   : {src}", file=out)
     print(f"移動先   : {dst}", file=out)
@@ -841,6 +857,15 @@ def cmd_move(args, config, s3, bucket, input_func, out):
         print_new_destination_warning(s3, bucket, config, dst, out)
         if not args.execute:
             print("ドライランのため作成しません。--execute で実行するときに作成するか確認します。", file=out)
+        elif mismatch:
+            # 組み合わせ不一致を承知のうえでの作成は、--allow-new-destination でも省略しない
+            answer = input_func(
+                f"別の Identity ID 配下に同名のユーザーID {dst.user_id} があることを承知のうえで、"
+                f"{owner_prefix(config, dst)} を新規作成しますか? 作成する場合は create と入力してください: ")
+            if answer.strip().lower() != "create":
+                print("中止しました。", file=out)
+                return 1
+            create_dst = True
         elif args.allow_new_destination:
             print("--allow-new-destination が指定されているため、移動時に作成します。", file=out)
             create_dst = True
@@ -942,6 +967,9 @@ def cmd_move(args, config, s3, bucket, input_func, out):
     if create_dst:
         print(f"  ※ 移動先フォルダを新規作成します: "
               f"{', '.join(status_prefix(config, dst, st) for st in STATUSES)}", file=out)
+    if mismatch:
+        print(f"  ※ ユーザーID {dst.user_id} は別の Identity ID 配下にもあります: "
+              f"{', '.join(o.identity_id for o in mismatch)}", file=out)
     print("=" * 70, file=out)
     print_plan(targets, config, out)
     print("", file=out)
@@ -965,6 +993,7 @@ def cmd_move(args, config, s3, bucket, input_func, out):
     meta = {"bucket": bucket,
             "src": {"identity_id": src.identity_id, "user_id": src.user_id},
             "dst": {"identity_id": dst.identity_id, "user_id": dst.user_id},
+            "id_mismatch_acknowledged_with": [o.identity_id for o in mismatch],
             "list_file": args.list,
             "started": now_iso(),
             "folders": [{"status": f.status, "name": f.name, "src": f.src_prefix,
@@ -1051,6 +1080,9 @@ def parse_args(argv):
     mp.add_argument("--dst-user-id", help="移動先のユーザーID")
     mp.add_argument("--dst-identity-id", help="移動先の Identity ID")
     mp.add_argument("--list", help="list -o で保存した一覧 CSV に含まれるフォルダを一括移動する")
+    mp.add_argument("--allow-id-mismatch", action="store_true",
+                    help="移動先のユーザーID が別の Identity ID 配下に存在しても、指定した Identity ID 配下に "
+                         "そのユーザーID のフォルダを作成して移動する (仮のユーザーID 用。実行時に create の入力が必要)")
     mp.add_argument("--allow-new-destination", action="store_true",
                     help="移動先の checked / unchecked フォルダが無い場合に、確認なしで作成する "
                          "(通常は使わず、実行時の確認で yes と答えること)")

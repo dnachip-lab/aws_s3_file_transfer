@@ -32,7 +32,7 @@ search で ID を確認 → list で一覧 CSV を作成 → CSV から不要な
 | --- | --- |
 | ドライラン | `--dry-run`（または `--execute` を付けない場合）は S3 を変更せず、移動されるファイルを 1 件ずつ「移動元 → 移動先」で表示し、レポート `logs/dryrun_*.json` を保存します |
 | ID の特定と存在チェック | 指定した ID が S3 に無い・一意に決まらない場合は中止します |
-| ユーザーID と Identity ID の組み合わせチェック | 両方を指定した組み合わせが S3 に無く、そのユーザーID が **別の Identity ID 配下に存在する** 場合は、組み合わせの誤りとして中止します（正しい Identity ID を表示します）。存在しないユーザーID フォルダを誤って作ってしまうことを防ぎます |
+| ユーザーID と Identity ID の組み合わせチェック | 両方を指定した組み合わせが S3 に無く、そのユーザーID が **別の Identity ID 配下に存在する** 場合は、組み合わせの誤りとして中止します（正しい Identity ID を表示します）。存在しないユーザーID フォルダを誤って作ってしまうことを防ぎます。意図的に作る場合は `--allow-id-mismatch` を付け、実行時に `create` と入力します |
 | 移動先フォルダが無い場合の確認 | 移動先の `checked` / `unchecked` フォルダがどちらも無い場合は警告を表示し、その Identity ID 配下の既存ユーザーID（打ち間違いの確認用）を示したうえで、新規作成するか `yes` / `no` で確認します。作成は最終確認がすべて済んでから行います（ドライランでは作成しません） |
 | Identity ID の形式チェック | `ap-northeast-1:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` の形式でなければ中止します |
 | 同一 ID の拒否 | 移動元と移動先が同じなら中止します |
@@ -380,6 +380,39 @@ python s3_move.py move --config config.json --src-user-id 000002 --dst-user-id 0
 - 途中で中止した場合、フォルダは作成されません。
 - ドライランでは作成せず、警告だけを表示します。
 
+### 同じ Identity ID に仮のユーザーID フォルダを作って移動する
+
+通常、ユーザーID と Identity ID の組み合わせが S3 に無く、そのユーザーID が別の Identity ID 配下にある場合は
+打ち間違いとみなして中止します。意図的にその組み合わせでフォルダを作る場合は `--allow-id-mismatch` を付けます。
+
+```bash
+# ① ドライラン: 警告と移動先を確認 (S3 は変更しない)
+python s3_move.py move --config config.json --list list_216001.csv \
+    --dst-identity-id ap-northeast-1:bafde89d-2122-400e-bcf9-446dbe00e12c --dst-user-id seimari \
+    --allow-id-mismatch --dry-run
+
+# ② 実行
+python s3_move.py move --config config.json --list list_216001.csv \
+    --dst-identity-id ap-northeast-1:bafde89d-2122-400e-bcf9-446dbe00e12c --dst-user-id seimari \
+    --allow-id-mismatch --execute
+```
+
+```
+※警告: 移動先のユーザーID seimari と Identity ID ap-northeast-1:bafde89d-... の組み合わせが一致しません。
+  ユーザーID seimari は次の Identity ID 配下にあります:
+    --dst-identity-id ap-northeast-1:(別の ID)
+  指定した Identity ID 配下のユーザーID: 216001
+  --allow-id-mismatch が指定されているため、... 新規作成する前提で続行します。
+...
+別の Identity ID 配下に同名のユーザーID seimari があることを承知のうえで、
+private/ap-northeast-1:bafde89d-.../seimari/ を新規作成しますか? 作成する場合は create と入力してください: create
+```
+
+- `create` 以外の入力（`yes` を含む）では中止します。`--allow-new-destination` を付けてもこの確認は省略されません。
+- その後、通常どおりフォルダ選択・移動先ユーザーID・Identity ID（全体）・`yes` の最終確認があります。
+- 操作ログの `meta.id_mismatch_acknowledged_with` に、同名ユーザーID のある Identity ID が記録されます。
+- 仮フォルダから戻すときは `undo` で元に戻せます。
+
 ### ID の指定について
 
 - ユーザーID と Identity ID は **どちらか一方だけ指定すれば、もう一方を S3 から特定** します。一意に決まらない場合は中止するので、両方指定してください。
@@ -417,6 +450,7 @@ python s3_move.py move --config config.json --src-user-id 000002 --dst-user-id 0
 | `--list FILE` | | | ✓ | 一覧 CSV のフォルダを一括移動（`--folder` / `--name` / `--since` / `--until` / `--status` とは併用不可） |
 | `--dry-run` | | | ✓ | ドライラン（既定）。S3 を変更せず移動予定ファイルの一覧とレポートを出力 |
 | `--execute` | | | ✓ | 実際に移動する（`--dry-run` とは併用不可） |
+| `--allow-id-mismatch` | | | ✓ | 移動先のユーザーID が別の Identity ID 配下にあっても、指定した Identity ID 配下にそのユーザーID のフォルダを作成して移動する（仮のユーザーID 用。実行時に `create` の入力が必要） |
 | `--allow-new-destination` | | | ✓ | 移動先の `checked` / `unchecked` フォルダが無い場合に、作成の確認を省略して作成する（通常は使わない） |
 
 ### undo: 移動を元に戻す
