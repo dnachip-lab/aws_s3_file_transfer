@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """S3 結果フォルダ移動ツール
 
-あるユーザーID / Identified ID の checked / unchecked フォルダ配下にある
-結果フォルダ (PDF, CSV) を、別のユーザーID / Identified ID の同じ
-checked / unchecked フォルダへ、確認しながら移動する。
+S3 の構成:
+    {bucket}/private/{Identity ID}/{ユーザーID}/{checked|unchecked}/{結果フォルダ}/*.pdf, *.csv
+    例: private/ap-northeast-1:05efdd85-9e44-4765-90e4-d8a9138bb7da/000002/checked/SAT0202301/
+
+あるユーザーID / Identity ID の checked / unchecked フォルダ配下にある
+結果フォルダを、別のユーザーID / Identity ID の同じ checked / unchecked
+フォルダへ、確認しながら移動する。
+ユーザーID と Identity ID はどちらか一方だけ指定すれば、もう一方を S3 から特定する。
 
 安全のための方針:
   * 既定はドライラン。--execute を付けたときだけ実際に移動する。
   * 移動元と移動先が同一なら中止。
-  * 移動先 ID のフォルダが S3 上に存在しなければ中止 (ID の打ち間違い対策)。
+  * ID から相手側の ID が一意に決まらない場合は中止。
+  * 移動先のフォルダが S3 上に存在しなければ中止 (ID の打ち間違い対策)。
   * 移動先に同名の結果フォルダ / 同名ファイルがある場合は上書きせずスキップ。
-  * 実行前に移動計画を表示し、移動先 ID の再入力と "yes" の入力を求める。
+  * 実行前に移動計画を表示し、移動先のユーザーID と Identity ID 末尾の再入力、
+    "yes" の入力を求める。
   * コピー後にサイズを検証し、フォルダ内の全ファイルの検証が済んでから
     移動元を削除する。
   * 全操作を JSON ログに記録する。
@@ -20,15 +27,29 @@ import argparse
 import datetime
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 
 STATUSES = ("checked", "unchecked")
 DELETE_BATCH = 1000
+CONFIRM_SUFFIX_LEN = 6
+DEFAULT_ROOT_PREFIX = "private/"
+DEFAULT_IDENTITY_PATTERN = r"^[a-z]{2}(-[a-z]+)+-\d+:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 
 
 class MoveError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class Owner:
+    """結果フォルダの持ち主 (Identity ID + ユーザーID)。"""
+    identity_id: str
+    user_id: str
+
+    def __str__(self):
+        return f"ユーザーID={self.user_id} / Identity ID={self.identity_id}"
 
 
 @dataclass
@@ -57,36 +78,38 @@ class ResultFolder:
 def load_config(path):
     with open(path, encoding="utf-8") as f:
         config = json.load(f)
-    if not config.get("id_types"):
-        raise MoveError("設定ファイルに id_types がありません")
-    for id_type, template in config["id_types"].items():
-        if "{id}" not in template or "{status}" not in template:
-            raise MoveError(
-                f"id_types.{id_type} のテンプレートには {{id}} と {{status}} が必要です: {template}")
+    root = config.get("root_prefix", DEFAULT_ROOT_PREFIX)
+    config["root_prefix"] = root if root.endswith("/") else root + "/"
+    config.setdefault("identity_id_pattern", DEFAULT_IDENTITY_PATTERN)
     return config
 
 
-def validate_id(id_value):
-    id_value = (id_value or "").strip()
-    if not id_value:
-        raise MoveError("ID が空です")
-    if "/" in id_value or id_value in (".", ".."):
-        raise MoveError(f"ID に使用できない文字が含まれています: {id_value!r}")
-    return id_value
+def validate_user_id(value):
+    value = (value or "").strip()
+    if not value:
+        raise MoveError("ユーザーID が空です")
+    if "/" in value or value in (".", ".."):
+        raise MoveError(f"ユーザーID に使用できない文字が含まれています: {value!r}")
+    return value
 
 
-def build_prefix(config, id_type, id_value, status):
-    if id_type not in config["id_types"]:
+def validate_identity_id(value, pattern):
+    value = (value or "").strip()
+    if not value:
+        raise MoveError("Identity ID が空です")
+    if not re.match(pattern, value):
         raise MoveError(
-            f"未定義の ID 種別です: {id_type} (定義済み: {', '.join(config['id_types'])})")
-    prefix = config["id_types"][id_type].format(id=id_value, status=status)
-    return prefix if prefix.endswith("/") else prefix + "/"
+            f"Identity ID の形式が正しくありません: {value!r} "
+            "(例: ap-northeast-1:05efdd85-9e44-4765-90e4-d8a9138bb7da)")
+    return value
 
 
-def id_exists(s3, bucket, config, id_type, id_value):
-    """その ID の checked / unchecked いずれかのフォルダが存在するか。"""
-    return any(prefix_exists(s3, bucket, build_prefix(config, id_type, id_value, st))
-               for st in STATUSES)
+def owner_prefix(config, owner):
+    return f"{config['root_prefix']}{owner.identity_id}/{owner.user_id}/"
+
+
+def status_prefix(config, owner, status):
+    return f"{owner_prefix(config, owner)}{status}/"
 
 
 # ---------------------------------------------------------------- S3 操作
@@ -124,13 +147,50 @@ def object_exists(s3, bucket, key):
         raise
 
 
+def owner_has_results(s3, bucket, config, owner):
+    """checked / unchecked いずれかのフォルダが存在するか。"""
+    return any(prefix_exists(s3, bucket, status_prefix(config, owner, st)) for st in STATUSES)
+
+
+# ---------------------------------------------------------------- ID の特定
+
+def resolve_owner(s3, bucket, config, label, user_id, identity_id, out):
+    """ユーザーID / Identity ID の片方しか指定されていなければ、もう片方を S3 から特定する。"""
+    root = config["root_prefix"]
+    if user_id and identity_id:
+        return Owner(identity_id, user_id)
+
+    if identity_id:
+        users = list_subfolders(s3, bucket, f"{root}{identity_id}/")
+        if not users:
+            raise MoveError(f"{label}の Identity ID のフォルダが見つかりません: {root}{identity_id}/")
+        if len(users) > 1:
+            raise MoveError(
+                f"{label}の Identity ID 配下に複数のユーザーID があります: {', '.join(users)}\n"
+                f"ユーザーID も指定してください。")
+        print(f"{label}のユーザーID を特定しました: {users[0]}", file=out)
+        return Owner(identity_id, users[0])
+
+    print(f"{label}のユーザーID {user_id} の Identity ID を検索しています...", file=out)
+    matches = [ident for ident in list_subfolders(s3, bucket, root)
+               if prefix_exists(s3, bucket, f"{root}{ident}/{user_id}/")]
+    if not matches:
+        raise MoveError(f"{label}のユーザーID が見つかりません: {user_id}")
+    if len(matches) > 1:
+        raise MoveError(
+            f"{label}のユーザーID {user_id} が複数の Identity ID 配下にあります: {', '.join(matches)}\n"
+            f"Identity ID も指定してください。")
+    print(f"{label}の Identity ID を特定しました: {matches[0]}", file=out)
+    return Owner(matches[0], user_id)
+
+
 # ---------------------------------------------------------------- 計画
 
-def build_plan(s3, bucket, config, src_type, src_id, dst_type, dst_id, statuses, folder_names=None):
+def build_plan(s3, bucket, config, src, dst, statuses, folder_names=None):
     plan = []
     for status in statuses:
-        src_prefix = build_prefix(config, src_type, src_id, status)
-        dst_prefix = build_prefix(config, dst_type, dst_id, status)
+        src_prefix = status_prefix(config, src, status)
+        dst_prefix = status_prefix(config, dst, status)
         for name in list_subfolders(s3, bucket, src_prefix):
             if folder_names and name not in folder_names:
                 continue
@@ -234,24 +294,30 @@ def write_log(log_dir, meta, entries):
 
 def parse_args(argv):
     p = argparse.ArgumentParser(
-        description="S3 上の結果フォルダを別のユーザーID / Identified ID のフォルダへ確認しながら移動します。")
+        description="S3 上の結果フォルダを別のユーザーID / Identity ID のフォルダへ確認しながら移動します。"
+                    "各 ID はどちらか一方だけの指定でも構いません。")
     p.add_argument("--config", default="config.json", help="設定ファイル (既定: config.json)")
     p.add_argument("--bucket", help="バケット名 (設定ファイルより優先)")
     p.add_argument("--profile", help="AWS プロファイル名")
     p.add_argument("--region", help="AWS リージョン")
-    p.add_argument("--src-type", required=True, help="移動元の ID 種別 (例: user_id, identified_id)")
-    p.add_argument("--src-id", required=True, help="移動元の ID")
-    p.add_argument("--dst-type", required=True, help="移動先の ID 種別 (例: user_id, identified_id)")
-    p.add_argument("--dst-id", required=True, help="移動先の ID")
+    p.add_argument("--src-user-id", help="移動元のユーザーID (例: 000002)")
+    p.add_argument("--src-identity-id", help="移動元の Identity ID (例: ap-northeast-1:05efdd85-...)")
+    p.add_argument("--dst-user-id", help="移動先のユーザーID")
+    p.add_argument("--dst-identity-id", help="移動先の Identity ID")
     p.add_argument("--status", choices=STATUSES + ("both",), default="both",
                    help="対象フォルダ (checked / unchecked / both、既定: both)")
     p.add_argument("--folder", action="append", dest="folders",
-                   help="対象の結果フォルダ名 (複数指定可。省略時は一覧から選択)")
+                   help="対象の結果フォルダ名 (例: SAT0202301。複数指定可。省略時は一覧から選択)")
     p.add_argument("--allow-new-destination", action="store_true",
-                   help="移動先 ID のフォルダが存在しなくても続行する (通常は使わないこと)")
+                   help="移動先のフォルダが存在しなくても続行する (通常は使わないこと)")
     p.add_argument("--execute", action="store_true",
                    help="実際に移動する。省略時はドライラン (計画の表示のみ)")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if not (args.src_user_id or args.src_identity_id):
+        p.error("--src-user-id か --src-identity-id の少なくとも一方を指定してください")
+    if not (args.dst_user_id or args.dst_identity_id):
+        p.error("--dst-user-id か --dst-identity-id の少なくとも一方を指定してください")
+    return args
 
 
 def make_client(args, config):
@@ -266,38 +332,42 @@ def run(argv=None, s3=None, input_func=input, out=sys.stdout):
     bucket = args.bucket or config.get("bucket")
     if not bucket:
         raise MoveError("バケット名が指定されていません (--bucket または設定ファイルの bucket)")
-    src_id = validate_id(args.src_id)
-    dst_id = validate_id(args.dst_id)
+    pattern = config["identity_id_pattern"]
+
+    def ids(user_id, identity_id):
+        return (validate_user_id(user_id) if user_id else None,
+                validate_identity_id(identity_id, pattern) if identity_id else None)
+
+    src_user, src_ident = ids(args.src_user_id, args.src_identity_id)
+    dst_user, dst_ident = ids(args.dst_user_id, args.dst_identity_id)
     statuses = STATUSES if args.status == "both" else (args.status,)
     expected_exts = [e.lower() for e in config.get("expected_extensions", [".pdf", ".csv"])]
-
-    if args.src_type == args.dst_type and src_id == dst_id:
-        raise MoveError("移動元と移動先が同じです")
-    for id_type in (args.src_type, args.dst_type):
-        build_prefix(config, id_type, "x", STATUSES[0])  # 未定義の種別ならここでエラー
 
     s3 = s3 or make_client(args, config)
 
     print(f"バケット : {bucket}", file=out)
-    print(f"移動元   : {args.src_type} = {src_id}", file=out)
-    print(f"移動先   : {args.dst_type} = {dst_id}", file=out)
-    print(f"対象     : {', '.join(statuses)}", file=out)
     print(f"モード   : {'実行' if args.execute else 'ドライラン (変更しません)'}", file=out)
+    src = resolve_owner(s3, bucket, config, "移動元", src_user, src_ident, out)
+    dst = resolve_owner(s3, bucket, config, "移動先", dst_user, dst_ident, out)
+    print(f"移動元   : {src}", file=out)
+    print(f"移動先   : {dst}", file=out)
+    print(f"対象     : {', '.join(statuses)}", file=out)
     print("", file=out)
 
-    if not id_exists(s3, bucket, config, args.src_type, src_id):
-        raise MoveError(f"移動元 ID のフォルダが見つかりません: {args.src_type} = {src_id}")
-    if not id_exists(s3, bucket, config, args.dst_type, dst_id):
-        dst_root = " / ".join(build_prefix(config, args.dst_type, dst_id, st) for st in STATUSES)
+    if src == dst:
+        raise MoveError("移動元と移動先が同じです")
+    if not owner_has_results(s3, bucket, config, src):
+        raise MoveError(f"移動元の checked / unchecked フォルダが見つかりません: {owner_prefix(config, src)}")
+    if not owner_has_results(s3, bucket, config, dst):
         if not args.allow_new_destination:
             raise MoveError(
-                f"移動先 ID のフォルダが見つかりません: {dst_root}\n"
-                "ID の打ち間違いがないか確認してください。新規 ID への移動が意図どおりであれば "
+                f"移動先の checked / unchecked フォルダが見つかりません: {owner_prefix(config, dst)}\n"
+                "ID の打ち間違いがないか確認してください。新規の移動先が意図どおりであれば "
                 "--allow-new-destination を付けて再実行してください。")
-        print(f"※警告: 移動先 ID のフォルダは存在しません。新規に作成されます: {dst_root}", file=out)
+        print(f"※警告: 移動先のフォルダは存在しません。新規に作成されます: {owner_prefix(config, dst)}",
+              file=out)
 
-    plan = build_plan(s3, bucket, config, args.src_type, src_id, args.dst_type, dst_id,
-                      statuses, args.folders)
+    plan = build_plan(s3, bucket, config, src, dst, statuses, args.folders)
     if args.folders:
         missing = sorted(set(args.folders) - {f.name for f in plan})
         if missing:
@@ -314,7 +384,7 @@ def run(argv=None, s3=None, input_func=input, out=sys.stdout):
         print("ドライランのため終了します。実際に移動するには --execute を付けて実行してください。", file=out)
         return 0
 
-    if not any(not f.dst_exists for f in plan):
+    if all(f.dst_exists for f in plan):
         print("移動できる結果フォルダがありません (すべて移動先に同名フォルダがあります)。", file=out)
         return 1
 
@@ -339,15 +409,19 @@ def run(argv=None, s3=None, input_func=input, out=sys.stdout):
     print("", file=out)
     print("=" * 70, file=out)
     print("以下の内容で移動します。移動先に間違いがないか必ず確認してください。", file=out)
-    print(f"  移動元: {args.src_type} = {src_id}", file=out)
-    print(f"  移動先: {args.dst_type} = {dst_id}", file=out)
+    print(f"  移動元: {src}", file=out)
+    print(f"  移動先: {dst}", file=out)
     print("=" * 70, file=out)
     print_plan(targets, expected_exts, out)
     print("", file=out)
 
-    typed = input_func(f"確認のため、移動先の ID を入力してください ({args.dst_type}): ")
-    if typed.strip() != dst_id:
-        print("移動先 ID が一致しません。中止しました。", file=out)
+    typed = input_func("確認のため、移動先のユーザーID を入力してください: ")
+    if typed.strip() != dst.user_id:
+        print("移動先のユーザーID が一致しません。中止しました。", file=out)
+        return 1
+    typed = input_func(f"確認のため、移動先の Identity ID の末尾 {CONFIRM_SUFFIX_LEN} 文字を入力してください: ")
+    if typed.strip().lower() != dst.identity_id[-CONFIRM_SUFFIX_LEN:].lower():
+        print("移動先の Identity ID が一致しません。中止しました。", file=out)
         return 1
     answer = input_func(f"{len(targets)} フォルダを移動します。実行してよろしいですか? (yes/no): ")
     if answer.strip().lower() != "yes":
@@ -356,11 +430,13 @@ def run(argv=None, s3=None, input_func=input, out=sys.stdout):
 
     # 3. 実行
     log = []
-    meta = {"bucket": bucket, "src_type": args.src_type, "src_id": src_id,
-            "dst_type": args.dst_type, "dst_id": dst_id, "started": now_iso(),
+    meta = {"bucket": bucket,
+            "src": {"identity_id": src.identity_id, "user_id": src.user_id},
+            "dst": {"identity_id": dst.identity_id, "user_id": dst.user_id},
+            "started": now_iso(),
             "folders": [{"status": f.status, "name": f.name, "src": f.src_prefix,
                          "dst": f.dst_prefix} for f in targets]}
-    failed = []
+    failed = None
     try:
         for f in targets:
             print(f"移動中: [{f.status}] {f.name} ...", end=" ", file=out, flush=True)
@@ -371,7 +447,7 @@ def run(argv=None, s3=None, input_func=input, out=sys.stdout):
                 print("失敗", file=out)
                 log.append({"action": "error", "folder": f.src_prefix, "error": str(e),
                             "time": now_iso()})
-                failed.append((f, e))
+                failed = (f, e)
                 break
     finally:
         meta["finished"] = now_iso()
@@ -379,7 +455,7 @@ def run(argv=None, s3=None, input_func=input, out=sys.stdout):
         print(f"操作ログ: {log_path}", file=out)
 
     if failed:
-        f, e = failed[0]
+        f, e = failed
         print(f"エラーのため処理を中断しました: {e}", file=out)
         print(f"失敗したフォルダ [{f.status}] {f.name} の移動元ファイルは削除されていません。"
               "移動先にコピー済みのファイルは操作ログで確認してください。", file=out)

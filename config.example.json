@@ -1,10 +1,7 @@
 {
-  "bucket": "your-bucket-name",
+  "bucket": "cp-reportsys-620665995161-test150400-test",
   "region": "ap-northeast-1",
-  "id_types": {
-    "user_id": "results/users/{id}/{status}/",
-    "identified_id": "results/identified/{id}/{status}/"
-  },
+  "root_prefix": "private/",
   "expected_extensions": [".pdf", ".csv"],
   "log_dir": "logs"
 }
