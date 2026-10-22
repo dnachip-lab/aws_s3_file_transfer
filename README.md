@@ -81,24 +81,24 @@ pip install -r requirements.txt
 ### 3. AWS の認証情報を設定する
 
 管理者から発行されたアクセスキー（または SSO の情報）を使って、プロファイルを作成します。
-ここではプロファイル名を `reportsys` とします。
+テスト環境用のプロファイル名は `dcr_iijima_dev` です。
 
 ```bash
 # アクセスキーの場合
-aws configure --profile reportsys
+aws configure --profile dcr_iijima_dev
 #   AWS Access Key ID     : （発行されたキー）
 #   AWS Secret Access Key : （発行されたシークレット）
 #   Default region name   : ap-northeast-1
 #   Default output format : json
 
 # SSO の場合
-aws configure sso --profile reportsys
+aws configure sso --profile dcr_iijima_dev
 ```
 
 設定できたか確認します（アカウント ID と利用者名が表示されれば OK）:
 
 ```bash
-aws sts get-caller-identity --profile reportsys
+aws sts get-caller-identity --profile dcr_iijima_dev
 ```
 
 使うユーザー / ロールには、対象バケットに対する次の権限が必要です（IAM ポリシーの例）:
@@ -134,6 +134,7 @@ cp config.example.json config.json        # Windows: copy config.example.json co
 {
   "bucket": "cp-reportsys-620665995161-test150400-test",
   "region": "ap-northeast-1",
+  "profile": "dcr_iijima_dev",
   "root_prefix": "private/",
   "expected_extensions": [".pdf", ".csv"],
   "utc_offset_hours": 9,
@@ -141,6 +142,7 @@ cp config.example.json config.json        # Windows: copy config.example.json co
 }
 ```
 
+- `profile`: 使用する AWS プロファイル名（テスト環境: `dcr_iijima_dev`）
 - `utc_offset_hours`: アップロード日の表示・期間判定に使うタイムゾーン（既定: 9 = 日本時間）
 - テスト用と本番用で設定を分けたい場合は `config.test.json` / `config.prod.json` のように作り、`--config config.prod.json` で切り替えます。
 
@@ -149,11 +151,11 @@ cp config.example.json config.json        # Windows: copy config.example.json co
 既存のユーザーID で検索し、結果が表示されればセットアップ完了です（S3 は変更しません）。
 
 ```bash
-python s3_move.py search --user-id 000002 --profile reportsys
+python s3_move.py search --user-id 000002
 ```
 
-> 毎回 `--profile` を付けるのが面倒な場合は、環境変数 `AWS_PROFILE` を設定してもかまいません
-> （PowerShell: `$env:AWS_PROFILE="reportsys"` / Mac・Linux: `export AWS_PROFILE=reportsys`）。
+> `s3_move.py` は `config.json` の `profile`（`dcr_iijima_dev`）を使うので、`--profile` を付ける必要はありません。
+> 一時的に別のプロファイルを使う場合だけ `--profile プロファイル名` を付けます。
 
 ## 2回目以降の手順
 
@@ -164,14 +166,14 @@ cd aws_s3_file_transfer
 .venv\Scripts\Activate.ps1                 # Mac / Linux: source .venv/bin/activate
 git pull                                    # ツールを最新にする
 pip install -r requirements.txt             # 更新があった場合に依存関係を反映
-aws sts get-caller-identity --profile reportsys   # 認証が有効か確認 (SSO は期限切れなら aws sso login --profile reportsys)
+aws sts get-caller-identity --profile dcr_iijima_dev   # 認証が有効か確認 (SSO は期限切れなら aws sso login --profile dcr_iijima_dev)
 ```
 
 `config.json` のバケット名が今回の作業対象（テスト / 本番）になっているか確認してください。
 
 ### 2. 移動作業
 
-以下では `--profile reportsys` を省略しています（`AWS_PROFILE` を設定していない場合は各コマンドに付けてください）。
+`s3_move.py` は `config.json` の `profile` を使うので、`--profile` は不要です。
 
 ```bash
 # ① 移動元・移動先の ID を確認

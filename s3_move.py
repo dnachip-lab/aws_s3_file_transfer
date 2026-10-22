@@ -692,7 +692,7 @@ def parse_args(argv):
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--config", default="config.json", help="設定ファイル (既定: config.json)")
     common.add_argument("--bucket", help="バケット名 (設定ファイルより優先)")
-    common.add_argument("--profile", help="AWS プロファイル名")
+    common.add_argument("--profile", help="AWS プロファイル名 (設定ファイルの profile より優先)")
     common.add_argument("--region", help="AWS リージョン")
 
     period = argparse.ArgumentParser(add_help=False)
@@ -750,7 +750,8 @@ def parse_args(argv):
 
 def make_client(args, config):
     import boto3
-    session = boto3.Session(profile_name=args.profile) if args.profile else boto3.Session()
+    profile = args.profile or config.get("profile")
+    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
     return session.client("s3", region_name=args.region or config.get("region"))
 
 
