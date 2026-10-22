@@ -18,6 +18,7 @@ S3 の構成:
 | `search` | Identity ID またはユーザーID で対象フォルダを検索する |
 | `list` | 移動対象となる結果フォルダ（PDF / CSV を含むもの）の一覧を、ファイル数・サイズ・アップロード日付きで表示する。アップロード日の期間で絞り込み、CSV に保存できる |
 | `move` | 結果フォルダを移動する。一覧から番号で選ぶ・期間で絞り込む・`list` で保存した CSV で一括移動する、のいずれかで対象を決める |
+| `undo` | `move` の操作ログ（`logs/move_*.json`）を使って、移動を元に戻す |
 
 基本の流れ:
 
@@ -31,6 +32,7 @@ search で ID を確認 → list で一覧 CSV を作成 → CSV から不要な
 | --- | --- |
 | ドライラン | `--dry-run`（または `--execute` を付けない場合）は S3 を変更せず、移動されるファイルを 1 件ずつ「移動元 → 移動先」で表示し、レポート `logs/dryrun_*.json` を保存します |
 | ID の特定と存在チェック | 指定した ID が S3 に無い・一意に決まらない場合は中止します |
+| ユーザーID と Identity ID の組み合わせチェック | 両方を指定した組み合わせが S3 に無く、そのユーザーID が **別の Identity ID 配下に存在する** 場合は、組み合わせの誤りとして中止します（正しい Identity ID を表示します）。存在しないユーザーID フォルダを誤って作ってしまうことを防ぎます |
 | 移動先フォルダが無い場合の確認 | 移動先の `checked` / `unchecked` フォルダがどちらも無い場合は警告を表示し、その Identity ID 配下の既存ユーザーID（打ち間違いの確認用）を示したうえで、新規作成するか `yes` / `no` で確認します。作成は最終確認がすべて済んでから行います（ドライランでは作成しません） |
 | Identity ID の形式チェック | `ap-northeast-1:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` の形式でなければ中止します |
 | 同一 ID の拒否 | 移動元と移動先が同じなら中止します |
@@ -417,9 +419,36 @@ python s3_move.py move --config config.json --src-user-id 000002 --dst-user-id 0
 | `--execute` | | | ✓ | 実際に移動する（`--dry-run` とは併用不可） |
 | `--allow-new-destination` | | | ✓ | 移動先の `checked` / `unchecked` フォルダが無い場合に、作成の確認を省略して作成する（通常は使わない） |
 
-### 元に戻すには
+### undo: 移動を元に戻す
 
-移動元と移動先を入れ替えて同じ手順で実行してください。移動した内容は操作ログで確認できます。
+`move --execute` の操作ログ（`logs/move_*.json`）を指定すると、そのとき移動したファイルを元の場所へ戻し、
+移動時に作成したフォルダ（中身が空のもの）を削除します。
+
+```bash
+# ① ドライラン (S3 は変更しない)。戻すファイルと戻し先を確認
+python s3_move.py undo --config config.json --log logs/move_20261022_110223.json
+
+# ② 実行。戻し先 (元の移動元) のユーザーID と yes を入力
+python s3_move.py undo --config config.json --log logs/move_20261022_110223.json --execute
+```
+
+```
+元に戻す : ユーザーID=seimari / Identity ID=ap-northeast-1:bafde89d-...
+      → : ユーザーID=216001 / Identity ID=ap-northeast-1:bafde89d-...
+
+移動元へ戻すファイル (2 件):
+  private/ap-northeast-1:bafde89d-.../seimari/checked/XXXX/a.pdf
+    → private/ap-northeast-1:bafde89d-.../216001/checked/XXXX/a.pdf
+  ...
+移動時に作成したフォルダ (中身が空なら削除):
+  private/ap-northeast-1:bafde89d-.../seimari/checked/
+  private/ap-northeast-1:bafde89d-.../seimari/unchecked/
+```
+
+- 戻し先に同名ファイルが既にある場合や、移動後に移動先のファイルが変更・削除されている場合は、そのファイルは対象外にして表示します（上書きしません）。
+- 途中で失敗した move（コピーのみで移動元が残っているもの）は、移動先のコピーを削除します。
+- undo 自体の操作も `logs/undo_*.json` に記録されます。
+- 操作ログが無い場合は、移動元と移動先を入れ替えて `move` を実行してください。
 
 ## テスト
 

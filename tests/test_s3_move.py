@@ -210,7 +210,7 @@ def test_missing_identity_folder_is_reported(env):
     s3, config, _ = env
     code, out = run(s3, config, ["move", "--src-user-id", "000002", "--dst-identity-id",
                                  "ap-northeast-1:00000000-0000-0000-0000-000000000000",
-                                 "--dst-user-id", "000003", "--dry-run"])
+                                 "--dst-user-id", "000777", "--dry-run"])
     assert "この Identity ID のフォルダも存在しません" in out
 
 
@@ -588,3 +588,66 @@ def test_bulk_execute_prints_plan_once(env):
     assert code == 0, out
     assert out.count("SAT0202301/\n") == 2  # 最終確認の 移動元/移動先 の 1 回分のみ
     assert "移動できないため対象外になる結果フォルダ:" in out  # SAT0202302 は衝突
+
+
+def test_user_identity_mismatch_aborts(env):
+    """移動元と同じ Identity ID に、別 Identity ID 配下に実在するユーザーID を組み合わせた場合。"""
+    s3, config, _ = env
+    before = keys(s3)
+    with pytest.raises(s3_move.MoveError) as ei:
+        run(s3, config, ["move", "--src-user-id", "000002",
+                         "--dst-identity-id", ID_A, "--dst-user-id", "000003", "--execute"],
+            ["yes", "all", "000003", ID_A, "yes"])
+    msg = str(ei.value)
+    assert "組み合わせが一致しません" in msg
+    assert f"--dst-identity-id {ID_B}" in msg
+    assert "指定した Identity ID 配下のユーザーID: 000002" in msg
+    assert keys(s3) == before
+
+
+def latest_log(tmp, kind):
+    files = sorted(f for f in os.listdir(tmp / "logs") if f.startswith(kind + "_"))
+    return str(tmp / "logs" / files[-1])
+
+
+def test_undo_restores_moved_files_and_created_folders(env):
+    s3, config, tmp = env
+    before = keys(s3)
+    code, out = run(s3, config, ["move", "--src-user-id", "000002"] + NEW_DST + ["--execute"],
+                    ["yes", "all", "000099", ID_B, "yes"])
+    assert code == 0, out
+    assert keys(s3) != before
+    log = latest_log(tmp, "move")
+
+    code, out = run(s3, config, ["undo", "--log", log])  # ドライラン
+    assert code == 0 and "移動元へ戻すファイル (4 件)" in out
+    assert keys(s3) != before
+
+    code, out = run(s3, config, ["undo", "--log", log, "--execute"], ["000099", "yes"])
+    assert code == 1  # 戻し先ユーザーID の誤入力
+    code, out = run(s3, config, ["undo", "--log", log, "--execute"], ["000002", "yes"])
+    assert code == 0, out
+    assert keys(s3) == before
+    # 2 回目は対象なし
+    code, out = run(s3, config, ["undo", "--log", log])
+    assert "元に戻す対象はありません" in out
+
+
+def test_undo_rejects_dry_run_report(env):
+    s3, config, tmp = env
+    run(s3, config, BASE + ["--dry-run"])
+    with pytest.raises(s3_move.MoveError, match="ドライランのレポートは元に戻せません"):
+        run(s3, config, ["undo", "--log", latest_log(tmp, "dryrun")])
+
+
+def test_undo_does_not_overwrite_existing_original(env):
+    s3, config, tmp = env
+    run(s3, config, BASE + ["--folder", "SAT0202301", "--execute"], ["all"] + CONFIRM)
+    log = latest_log(tmp, "move")
+    s3.put_object(Bucket=BUCKET, Key=f"private/{ID_A}/000002/checked/SAT0202301/report.pdf", Body=b"new")
+    code, out = run(s3, config, ["undo", "--log", log, "--execute"], ["000002", "yes"])
+    assert code == 0, out
+    assert "上書きしません" in out
+    body = s3.get_object(Bucket=BUCKET, Key=f"private/{ID_A}/000002/checked/SAT0202301/report.pdf")["Body"].read()
+    assert body == b"new"
+    assert f"private/{ID_A}/000002/checked/SAT0202301/data.csv" in keys(s3)

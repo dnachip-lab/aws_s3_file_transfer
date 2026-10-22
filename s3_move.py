@@ -232,10 +232,33 @@ def owner_summary(s3, bucket, config, owner):
     return f"移動対象フォルダ {counts} / 最終アップロード {format_dt(last, config['tz']) or 'なし'}"
 
 
+def check_pair_mismatch(s3, bucket, config, label, owner, out):
+    """指定されたユーザーID と Identity ID の組が S3 に無いとき、そのユーザーID が別の Identity ID
+    配下に存在すれば組み合わせの誤りとして中止する。"""
+    print(f"{label}のユーザーID {owner.user_id} が他の Identity ID 配下にないか確認しています...", file=out)
+    others = [o for o in find_owners(s3, bucket, config, owner.user_id) if o != owner]
+    if others:
+        option = OPTION_PREFIX.get(label, "--") + "identity-id"
+        lines = [f"{label}のユーザーID {owner.user_id} と Identity ID {owner.identity_id} の組み合わせが"
+                 "一致しません。",
+                 f"  ユーザーID {owner.user_id} は次の Identity ID 配下にあります:"]
+        for o in others:
+            lines.append(f"    {option} {o.identity_id}")
+            lines.append(f"      {owner_summary(s3, bucket, config, o)}")
+        users = list_subfolders(s3, bucket, f"{config['root_prefix']}{owner.identity_id}/")
+        if users:
+            lines.append(f"  指定した Identity ID 配下のユーザーID: {', '.join(users[:20])}")
+        lines.append("ユーザーID と Identity ID の組み合わせを確認してください。")
+        raise MoveError("\n".join(lines))
+
+
 def resolve_owner(s3, bucket, config, label, user_id, identity_id, out):
     """ユーザーID / Identity ID から持ち主を 1 つに特定する。一意に決まらなければ中止。"""
     if user_id and identity_id:
-        return Owner(identity_id, user_id)
+        owner = Owner(identity_id, user_id)
+        if not prefix_exists(s3, bucket, owner_prefix(config, owner)):
+            check_pair_mismatch(s3, bucket, config, label, owner, out)
+        return owner
     if user_id:
         print(f"{label}のユーザーID {user_id} の Identity ID を検索しています...", file=out)
     matches = find_owners(s3, bucket, config, user_id, identity_id)
@@ -551,6 +574,141 @@ def dry_run_report(plan, config, out):
 
 
 # ---------------------------------------------------------------- サブコマンド
+
+def load_move_log(path):
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    meta = data.get("meta", {})
+    if meta.get("dry_run"):
+        raise MoveError(f"ドライランのレポートは元に戻せません (S3 は変更されていません): {path}")
+    if "src" not in meta or "dst" not in meta:
+        raise MoveError(f"操作ログの形式が正しくありません: {path}")
+    return meta, data.get("operations", [])
+
+
+def build_undo_plan(s3, bucket, operations):
+    """操作ログから元に戻す手順を作る。
+    戻り値: (restore, cleanup, remove_markers, problems)
+      restore : 移動済み (移動元削除済み) のファイル。移動先 → 移動元へ戻して移動先を削除
+      cleanup : コピーのみ (移動元が残っている) のファイル。移動先のコピーを削除
+      remove_markers : 移動時に作成したフォルダオブジェクト
+    """
+    deleted = {o["src"] for o in operations if o.get("action") == "delete"}
+    restore, cleanup, problems = [], [], []
+    for o in operations:
+        if o.get("action") != "copy":
+            continue
+        original, moved, size = o["src"], o["dst"], o["size"]
+        try:
+            head = s3.head_object(Bucket=bucket, Key=moved)
+        except Exception:
+            head = None
+        if head is None:
+            problems.append(f"移動先にファイルがありません (既に戻した可能性があります): {moved}")
+            continue
+        if head["ContentLength"] != size:
+            problems.append(f"移動後にファイルが変更されています (サイズ {size} → {head['ContentLength']}): {moved}")
+            continue
+        if original in deleted:
+            if object_exists(s3, bucket, original):
+                problems.append(f"移動元に同名ファイルが既にあります (上書きしません): {original}")
+                continue
+            restore.append({"original": original, "moved": moved, "size": size})
+        else:
+            if not object_exists(s3, bucket, original):
+                problems.append(f"移動元のファイルが見つかりません: {original}")
+                continue
+            cleanup.append({"original": original, "moved": moved, "size": size})
+    markers = [o["key"] for o in operations
+               if o.get("action") == "create_folder" and object_exists(s3, bucket, o["key"])]
+    return restore, cleanup, markers, problems
+
+
+def cmd_undo(args, config, s3, bucket, input_func, out):
+    meta, operations = load_move_log(args.log)
+    if meta.get("bucket") and meta["bucket"] != bucket:
+        raise MoveError(f"操作ログのバケット ({meta['bucket']}) と設定のバケット ({bucket}) が異なります")
+    src = Owner(meta["src"]["identity_id"], meta["src"]["user_id"])
+    dst = Owner(meta["dst"]["identity_id"], meta["dst"]["user_id"])
+
+    print(f"バケット : {bucket}", file=out)
+    print(f"モード   : {'実行' if args.execute else 'ドライラン (S3 は変更しません)'}", file=out)
+    print(f"操作ログ : {args.log} (実行日時 {meta.get('started', '?')})", file=out)
+    print(f"元に戻す : {dst}", file=out)
+    print(f"      → : {src}", file=out)
+    print("", file=out)
+
+    restore, cleanup, markers, problems = build_undo_plan(s3, bucket, operations)
+    if restore:
+        print(f"移動元へ戻すファイル ({len(restore)} 件):", file=out)
+        for r in restore:
+            print(f"  {r['moved']}", file=out)
+            print(f"    → {r['original']}", file=out)
+    if cleanup:
+        print(f"移動先から削除するコピー ({len(cleanup)} 件、移動元は残っています):", file=out)
+        for c in cleanup:
+            print(f"  {c['moved']}", file=out)
+    if markers:
+        print("移動時に作成したフォルダ (中身が空なら削除):", file=out)
+        for m in markers:
+            print(f"  {m}", file=out)
+    if problems:
+        print("", file=out)
+        print(f"※ 次の {len(problems)} 件は対象外です:", file=out)
+        for p_ in problems:
+            print(f"  {p_}", file=out)
+    print("", file=out)
+    if not (restore or cleanup or markers):
+        print("元に戻す対象はありません。", file=out)
+        return 0 if not problems else 1
+    if not args.execute:
+        print("ドライランのため終了します。元に戻すには --execute を付けて実行してください。", file=out)
+        return 0
+
+    typed = input_func("確認のため、戻し先 (元の移動元) のユーザーID を入力してください: ")
+    if typed.strip() != src.user_id:
+        print("ユーザーID が一致しません。中止しました。", file=out)
+        return 1
+    answer = input_func(f"{len(restore)} ファイルを戻し、{len(cleanup)} 件のコピーを削除します。"
+                        "実行してよろしいですか? (yes/no): ")
+    if answer.strip().lower() != "yes":
+        print("中止しました。", file=out)
+        return 1
+
+    log = []
+    undo_meta = {"bucket": bucket, "undo_of": args.log,
+                 "src": meta["dst"], "dst": meta["src"], "started": now_iso()}
+    try:
+        for r in restore:
+            s3.copy({"Bucket": bucket, "Key": r["moved"]}, bucket, r["original"])
+            head = s3.head_object(Bucket=bucket, Key=r["original"])
+            if head["ContentLength"] != r["size"]:
+                raise MoveError(f"戻したファイルのサイズが一致しません: {r['original']}")
+            log.append({"action": "copy", "src": r["moved"], "dst": r["original"], "size": r["size"],
+                        "time": now_iso()})
+        to_delete = [r["moved"] for r in restore] + [c["moved"] for c in cleanup]
+        for i in range(0, len(to_delete), DELETE_BATCH):
+            batch = to_delete[i:i + DELETE_BATCH]
+            resp = s3.delete_objects(
+                Bucket=bucket, Delete={"Objects": [{"Key": k} for k in batch], "Quiet": True})
+            if resp.get("Errors"):
+                raise MoveError(f"移動先の削除に失敗しました: {resp['Errors']}")
+            for k in batch:
+                log.append({"action": "delete", "src": k, "time": now_iso()})
+        for m in markers:
+            remaining = [o for o in list_objects(s3, bucket, m)]
+            if remaining:
+                print(f"フォルダに他のファイルがあるため残します: {m}", file=out)
+                continue
+            s3.delete_object(Bucket=bucket, Key=m)
+            log.append({"action": "delete_folder", "key": m, "time": now_iso()})
+    finally:
+        undo_meta["finished"] = now_iso()
+        path = write_log(config.get("log_dir", "logs"), undo_meta, log, kind="undo")
+        print(f"操作ログ: {path}", file=out)
+    print(f"元に戻しました ({len(restore)} ファイルを戻し、{len(cleanup)} 件のコピーを削除)。", file=out)
+    return 0
+
 
 def cmd_search(args, config, s3, bucket, input_func, out):
     user_id, identity_id = validated_ids(config, args.user_id, args.identity_id)
@@ -902,6 +1060,12 @@ def parse_args(argv):
     mode.add_argument("--execute", action="store_true",
                       help="実際に移動する。省略時はドライラン")
 
+    up = sub.add_parser("undo", parents=[common], help="move の操作ログを使って移動を元に戻す")
+    up.add_argument("--log", required=True, help="元に戻す move の操作ログ (logs/move_*.json)")
+    umode = up.add_mutually_exclusive_group()
+    umode.add_argument("--dry-run", action="store_true", help="ドライラン (既定): 戻す内容の表示のみ")
+    umode.add_argument("--execute", action="store_true", help="実際に元に戻す")
+
     args = p.parse_args(argv)
     if hasattr(args, "folders"):
         args.folders = split_names(args.folders)
@@ -987,7 +1151,7 @@ def explain_aws_error(e, profile, bucket):
     return MoveError("\n".join(lines))
 
 
-COMMANDS = {"search": cmd_search, "list": cmd_list, "move": cmd_move}
+COMMANDS = {"search": cmd_search, "list": cmd_list, "move": cmd_move, "undo": cmd_undo}
 
 
 def run(argv=None, s3=None, input_func=input, out=sys.stdout):
