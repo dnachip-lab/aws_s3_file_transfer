@@ -401,7 +401,7 @@ def move_folder(s3, bucket, folder, log):
     """フォルダ内の全オブジェクトをコピー・検証し、すべて成功したら移動元を削除する。"""
     copied = []
     for obj in folder.objects:
-        dst_key = folder.dst_prefix + obj["Key"][len(folder.src_prefix):]
+        dst_key = dst_key_of(folder, obj)
         if object_exists(s3, bucket, dst_key):
             raise MoveError(f"移動先に既にファイルがあります (上書きしません): {dst_key}")
         s3.copy({"Bucket": bucket, "Key": obj["Key"]}, bucket, dst_key)
@@ -427,12 +427,42 @@ def now_iso():
     return datetime.datetime.now().isoformat(timespec="seconds")
 
 
-def write_log(log_dir, meta, entries):
+def write_log(log_dir, meta, entries, kind="move"):
     os.makedirs(log_dir, exist_ok=True)
-    path = os.path.join(log_dir, f"move_{datetime.datetime.now():%Y%m%d_%H%M%S}.json")
+    path = os.path.join(log_dir, f"{kind}_{datetime.datetime.now():%Y%m%d_%H%M%S}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"meta": meta, "operations": entries}, f, ensure_ascii=False, indent=2)
     return path
+
+
+def dst_key_of(folder, obj):
+    return folder.dst_prefix + obj["Key"][len(folder.src_prefix):]
+
+
+def dry_run_report(plan, config, out):
+    """ドライラン: 移動されるファイルを 1 件ずつ表示し、レポート用の操作一覧を返す。"""
+    tz = config["tz"]
+    entries = []
+    movable = [f for f in plan if not f.blocked]
+    print("移動予定のファイル (ドライラン):", file=out)
+    for f in movable:
+        print(f"  [{f.status}] {f.name}", file=out)
+        for obj in f.objects:
+            dst = dst_key_of(f, obj)
+            print(f"    {obj['Key']}", file=out)
+            print(f"      → {dst}  ({format_size(obj['Size'])}, "
+                  f"アップロード {format_dt(obj['LastModified'], tz)})", file=out)
+            entries.append({"action": "planned_move", "src": obj["Key"], "dst": dst,
+                            "size": obj["Size"]})
+    for f in plan:
+        if f.blocked:
+            entries.append({"action": "skip", "folder": f.src_prefix, "reason": f.blocked})
+    print("", file=out)
+    print(f"移動予定: {len(movable)} フォルダ / {sum(len(f.objects) for f in movable)} ファイル / "
+          f"{format_size(sum(f.total_size for f in movable))}", file=out)
+    if len(movable) != len(plan):
+        print(f"対象外  : {len(plan) - len(movable)} フォルダ (移動不可の理由は上の一覧を参照)", file=out)
+    return entries
 
 
 # ---------------------------------------------------------------- サブコマンド
@@ -484,7 +514,7 @@ def cmd_move(args, config, s3, bucket, input_func, out):
     dst_user, dst_ident = validated_ids(config, args.dst_user_id, args.dst_identity_id)
 
     print(f"バケット : {bucket}", file=out)
-    print(f"モード   : {'実行' if args.execute else 'ドライラン (変更しません)'}", file=out)
+    print(f"モード   : {'実行' if args.execute else 'ドライラン (S3 は変更しません)'}", file=out)
 
     entries = None
     if args.list:
@@ -556,7 +586,17 @@ def cmd_move(args, config, s3, bucket, input_func, out):
         print(f"※ {len(blocked)} フォルダは移動できないため対象外になります。", file=out)
 
     if not args.execute:
-        print("ドライランのため終了します。実際に移動するには --execute を付けて実行してください。", file=out)
+        entries = dry_run_report(plan, config, out)
+        meta = {"bucket": bucket, "dry_run": True,
+                "src": {"identity_id": src.identity_id, "user_id": src.user_id},
+                "dst": {"identity_id": dst.identity_id, "user_id": dst.user_id},
+                "list_file": args.list, "created": now_iso()}
+        path = write_log(config.get("log_dir", "logs"), meta, entries, kind="dryrun")
+        print(f"ドライランレポート: {path}", file=out)
+        print("", file=out)
+        print("ドライランのため S3 は変更していません。内容に問題がなければ、"
+              "同じコマンドの --dry-run を --execute に替えて (または --execute を付けて) 実行してください。",
+              file=out)
         return 0
 
     if len(blocked) == len(plan):
@@ -689,8 +729,11 @@ def parse_args(argv):
     mp.add_argument("--list", help="list -o で保存した一覧 CSV に含まれるフォルダを一括移動する")
     mp.add_argument("--allow-new-destination", action="store_true",
                     help="移動先のフォルダが存在しなくても続行する (通常は使わないこと)")
-    mp.add_argument("--execute", action="store_true",
-                    help="実際に移動する。省略時はドライラン (計画の表示のみ)")
+    mode = mp.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true",
+                      help="ドライラン: S3 を変更せず、移動されるファイルの一覧とレポートを出力する (既定)")
+    mode.add_argument("--execute", action="store_true",
+                      help="実際に移動する。省略時はドライラン")
 
     args = p.parse_args(argv)
     if args.command in ("search", "list") and not (args.user_id or args.identity_id):

@@ -323,3 +323,27 @@ def test_bulk_move_src_mismatch_rejected(env):
     run(s3, config, ["list", "--user-id", "000002", "-o", str(path)])
     with pytest.raises(s3_move.MoveError, match="一致しません"):
         run(s3, config, ["move", "--list", str(path), "--src-user-id", "000009", "--dst-user-id", "000003"])
+
+
+def test_dry_run_flag_lists_files_and_writes_report(env):
+    s3, config, tmp = env
+    before = keys(s3)
+    code, out = run(s3, config, BASE + ["--dry-run"])
+    assert code == 0
+    assert keys(s3) == before
+    assert f"→ private/{ID_B}/000003/checked/SAT0202301/data.csv" in out
+    assert "移動予定: 2 フォルダ / 3 ファイル" in out
+    assert "対象外  : 1 フォルダ" in out
+    reports = [f for f in os.listdir(tmp / "logs") if f.startswith("dryrun_")]
+    assert len(reports) == 1
+    report = json.loads((tmp / "logs" / reports[0]).read_text())
+    assert report["meta"]["dry_run"] is True
+    planned = [o for o in report["operations"] if o["action"] == "planned_move"]
+    skipped = [o for o in report["operations"] if o["action"] == "skip"]
+    assert len(planned) == 3 and len(skipped) == 1
+
+
+def test_dry_run_and_execute_are_exclusive(env):
+    s3, config, _ = env
+    with pytest.raises(SystemExit):
+        run(s3, config, BASE + ["--dry-run", "--execute"])
