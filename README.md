@@ -144,17 +144,21 @@ cp config.example.json config.json        # Windows: copy config.example.json co
 
 - `profile`: 使用する AWS プロファイル名（テスト環境: `dcr_iijima_dev`）
 - `utc_offset_hours`: アップロード日の表示・期間判定に使うタイムゾーン（既定: 9 = 日本時間）
-- テスト用と本番用で設定を分けたい場合は `config.test.json` / `config.prod.json` のように作り、`--config config.prod.json` で切り替えます。
+- テスト用と本番用で設定を分けたい場合は `config.test.json` / `config.prod.json` のように作り、各コマンドの `--config config.prod.json` で切り替えます。
 
 ### 5. 動作確認
 
 既存のユーザーID で検索し、結果が表示されればセットアップ完了です（S3 は変更しません）。
 
 ```bash
-python s3_move.py search --user-id 000002
+python s3_move.py search --config config.json --user-id 000002
 ```
 
-> `s3_move.py` は `config.json` の `profile`（`dcr_iijima_dev`）を使うので、`--profile` を付ける必要はありません。
+> `--config` で使用する設定ファイルを指定します。`--config` はサブコマンド（`search` / `list` / `move`）の **後ろ** に書きます。
+> 本手順書のコマンド例ではすべて `--config config.json` を明記しています（省略した場合も `config.json` が使われます）。
+> 本番用など別の設定ファイルを使うときは `--config config.prod.json` のように指定してください。
+>
+> `s3_move.py` は設定ファイルの `profile`（`dcr_iijima_dev`）を使うので、`--profile` を付ける必要はありません。
 > 一時的に別のプロファイルを使う場合だけ `--profile プロファイル名` を付けます。
 
 ## 2回目以降の手順
@@ -173,27 +177,27 @@ aws sts get-caller-identity --profile dcr_iijima_dev   # 認証が有効か確�
 
 ### 2. 移動作業
 
-`s3_move.py` は `config.json` の `profile` を使うので、`--profile` は不要です。
+各コマンドの `--config` には今回の作業対象（テスト / 本番）の設定ファイルを指定します。`s3_move.py` は設定ファイルの `profile` を使うので、`--profile` は不要です。
 
 ```bash
 # ① 移動元・移動先の ID を確認
-python s3_move.py search --user-id 000002
-python s3_move.py search --user-id 000003
+python s3_move.py search --config config.json --user-id 000002
+python s3_move.py search --config config.json --user-id 000003
 
 # ② 移動対象の一覧を作成 (必要に応じて --status / --since / --until で絞り込み)
-python s3_move.py list --user-id 000002 --since 2026-10-01 --until 2026-10-31 -o list_000002.csv
+python s3_move.py list --config config.json --user-id 000002 --since 2026-10-01 --until 2026-10-31 -o list_000002.csv
 
 # ③ list_000002.csv を Excel 等で開き、移動しない行を削除して保存
 
 # ④ ドライラン (S3 は変更しない)。移動先のパスと件数を必ず確認
-python s3_move.py move --list list_000002.csv --dst-user-id 000003 --dry-run
+python s3_move.py move --config config.json --list list_000002.csv --dst-user-id 000003 --dry-run
 
 # ⑤ 問題なければ実行。画面の指示に従って移動先ユーザーID・Identity ID 末尾 6 文字・yes を入力
-python s3_move.py move --list list_000002.csv --dst-user-id 000003 --execute
+python s3_move.py move --config config.json --list list_000002.csv --dst-user-id 000003 --execute
 
 # ⑥ 結果を確認 (移動元に残っていないこと、移動先に入ったこと)
-python s3_move.py list --user-id 000002
-python s3_move.py list --user-id 000003
+python s3_move.py list --config config.json --user-id 000002
+python s3_move.py list --config config.json --user-id 000003
 ```
 
 - 操作ログ（`logs/move_*.json`）とドライランレポート（`logs/dryrun_*.json`）は作業記録として保管してください。
@@ -204,8 +208,8 @@ python s3_move.py list --user-id 000003
 ### search: 対象フォルダの検索
 
 ```bash
-python s3_move.py search --user-id 000002
-python s3_move.py search --identity-id ap-northeast-1:05efdd85-9e44-4765-90e4-d8a9138bb7da
+python s3_move.py search --config config.json --user-id 000002
+python s3_move.py search --config config.json --identity-id ap-northeast-1:05efdd85-9e44-4765-90e4-d8a9138bb7da
 ```
 
 ```
@@ -218,7 +222,7 @@ python s3_move.py search --identity-id ap-northeast-1:05efdd85-9e44-4765-90e4-d8
 
 ```bash
 # 2026年10月にアップロードされた checked の結果フォルダを一覧表示し、CSV に保存
-python s3_move.py list --user-id 000002 --status checked \
+python s3_move.py list --config config.json --user-id 000002 --status checked \
                        --since 2026-10-01 --until 2026-10-31 -o list.csv
 ```
 
@@ -242,21 +246,21 @@ python s3_move.py list --user-id 000002 --status checked \
 **一覧 CSV で一括移動**（不要な行を削除した CSV を使う）
 
 ```bash
-python s3_move.py move --list list.csv --dst-user-id 000003 --dry-run  # ドライラン
-python s3_move.py move --list list.csv --dst-user-id 000003 --execute  # 実行
+python s3_move.py move --config config.json --list list.csv --dst-user-id 000003 --dry-run  # ドライラン
+python s3_move.py move --config config.json --list list.csv --dst-user-id 000003 --execute  # 実行
 ```
 
 **期間で絞り込んで移動**
 
 ```bash
-python s3_move.py move --src-user-id 000002 --dst-user-id 000003 \
+python s3_move.py move --config config.json --src-user-id 000002 --dst-user-id 000003 \
                        --since 2026-10-01 --until 2026-10-31 --execute
 ```
 
 **一覧から番号で選んで移動**
 
 ```bash
-python s3_move.py move --src-user-id 000002 --dst-user-id 000003 --execute
+python s3_move.py move --config config.json --src-user-id 000002 --dst-user-id 000003 --execute
 ```
 
 ドライランの出力（S3 は変更しません）:
