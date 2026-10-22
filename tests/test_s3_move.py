@@ -1,3 +1,5 @@
+import csv
+import datetime
 import io
 import json
 import os
@@ -42,6 +44,7 @@ def env(tmp_path, monkeypatch):
             f"private/{ID_B}/000003/unchecked/OLD/data.csv",
             f"private/{ID_C}/000004/checked/X/a.pdf",
             f"private/{ID_C}/000005/checked/Y/a.pdf",
+            f"private/{ID_A}/000002/checked/EMPTY/memo.txt",  # PDF/CSV なし → 対象外
         ]:
             s3.put_object(Bucket=BUCKET, Key=key, Body=b"content-" + key.encode())
         yield s3, str(config_path), tmp_path
@@ -55,12 +58,12 @@ def keys(s3):
 def run(s3, config, args, answers=()):
     answers = iter(answers)
     out = io.StringIO()
-    code = s3_move.run(["--config", config] + args, s3=s3,
+    code = s3_move.run(args[:1] + ["--config", config] + args[1:], s3=s3,
                        input_func=lambda _prompt: next(answers), out=out)
     return code, out.getvalue()
 
 
-BASE = ["--src-user-id", "000002", "--dst-user-id", "000003"]
+BASE = ["move", "--src-user-id", "000002", "--dst-user-id", "000003"]
 CONFIRM = ["000003", "abcdef", "yes"]  # ユーザーID, Identity ID 末尾6文字, yes
 
 
@@ -97,7 +100,7 @@ def test_execute_moves_selected_folders(env):
 
 def test_identity_id_only(env):
     s3, config, _ = env
-    args = ["--src-identity-id", ID_A, "--dst-identity-id", ID_B, "--status", "unchecked", "--execute"]
+    args = ["move", "--src-identity-id", ID_A, "--dst-identity-id", ID_B, "--status", "unchecked", "--execute"]
     code, out = run(s3, config, args, ["all"] + CONFIRM)
     assert code == 0, out
     k = keys(s3)
@@ -107,8 +110,8 @@ def test_identity_id_only(env):
 
 def test_identity_with_multiple_users_requires_user_id(env):
     s3, config, _ = env
-    with pytest.raises(s3_move.MoveError, match="複数のユーザーID"):
-        run(s3, config, ["--src-user-id", "000002", "--dst-identity-id", ID_C])
+    with pytest.raises(s3_move.MoveError, match="該当するユーザーIDが複数あります"):
+        run(s3, config, ["move", "--src-user-id", "000002", "--dst-identity-id", ID_C])
 
 
 def test_folder_option(env):
@@ -148,13 +151,13 @@ def test_not_yes_aborts(env):
 
 def test_unknown_destination_user_aborts(env):
     s3, config, _ = env
-    with pytest.raises(s3_move.MoveError, match="移動先のユーザーID が見つかりません"):
-        run(s3, config, ["--src-user-id", "000002", "--dst-user-id", "00003"])
+    with pytest.raises(s3_move.MoveError, match="移動先のユーザーID 00003 が見つかりません"):
+        run(s3, config, ["move", "--src-user-id", "000002", "--dst-user-id", "00003"])
 
 
 def test_missing_destination_folder_aborts(env):
     s3, config, _ = env
-    args = ["--src-user-id", "000002", "--dst-identity-id", ID_B, "--dst-user-id", "000099"]
+    args = ["move", "--src-user-id", "000002", "--dst-identity-id", ID_B, "--dst-user-id", "000099"]
     with pytest.raises(s3_move.MoveError, match="移動先の checked / unchecked フォルダが見つかりません"):
         run(s3, config, args)
 
@@ -162,7 +165,7 @@ def test_missing_destination_folder_aborts(env):
 def test_same_source_and_destination_aborts(env):
     s3, config, _ = env
     with pytest.raises(s3_move.MoveError, match="同じ"):
-        run(s3, config, ["--src-user-id", "000002", "--dst-identity-id", ID_A])
+        run(s3, config, ["move", "--src-user-id", "000002", "--dst-identity-id", ID_A])
 
 
 def test_conflicting_folder_cannot_be_selected(env):
@@ -176,10 +179,147 @@ def test_conflicting_folder_cannot_be_selected(env):
 def test_invalid_identity_id_rejected(env):
     s3, config, _ = env
     with pytest.raises(s3_move.MoveError, match="形式が正しくありません"):
-        run(s3, config, ["--src-user-id", "000002", "--dst-identity-id", "05efdd85-9e44"])
+        run(s3, config, ["move", "--src-user-id", "000002", "--dst-identity-id", "05efdd85-9e44"])
 
 
 def test_invalid_user_id_rejected(env):
     s3, config, _ = env
     with pytest.raises(s3_move.MoveError, match="使用できない"):
-        run(s3, config, ["--src-user-id", "000002", "--dst-user-id", "../000003"])
+        run(s3, config, ["move", "--src-user-id", "000002", "--dst-user-id", "../000003"])
+
+
+JST = datetime.timezone(datetime.timedelta(hours=9))
+TODAY = datetime.datetime.now(JST).date()
+YESTERDAY = TODAY - datetime.timedelta(days=1)
+
+
+def test_folder_without_pdf_csv_is_excluded(env):
+    s3, config, _ = env
+    code, out = run(s3, config, BASE)
+    assert "EMPTY" not in out
+
+
+def test_search_by_user_id(env):
+    s3, config, _ = env
+    code, out = run(s3, config, ["search", "--user-id", "000002"])
+    assert code == 0
+    assert "1 件見つかりました" in out
+    assert ID_A in out
+    assert "checked: 2, unchecked: 1" in out
+
+
+def test_search_by_identity_id_lists_all_users(env):
+    s3, config, _ = env
+    code, out = run(s3, config, ["search", "--identity-id", ID_C])
+    assert code == 0
+    assert "2 件見つかりました" in out
+    assert "000004" in out and "000005" in out
+
+
+def test_search_not_found(env):
+    s3, config, _ = env
+    code, out = run(s3, config, ["search", "--user-id", "999999"])
+    assert code == 1
+
+
+def test_list_shows_upload_dates_and_saves_csv(env):
+    s3, config, tmp = env
+    path = tmp / "list.csv"
+    code, out = run(s3, config, ["list", "--user-id", "000002", "-o", str(path)])
+    assert code == 0, out
+    assert "SAT0202301" in out and "SAT0202303" in out
+    assert TODAY.isoformat() in out
+    with open(path, encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+    assert [(r["status"], r["folder"]) for r in rows] == [
+        ("checked", "SAT0202301"), ("checked", "SAT0202302"), ("unchecked", "SAT0202303")]
+    r = rows[0]
+    assert r["identity_id"] == ID_A and r["user_id"] == "000002"
+    assert (r["pdf_count"], r["csv_count"], r["file_count"]) == ("1", "1", "2")
+    assert r["last_uploaded"].startswith(TODAY.isoformat())
+
+
+def test_list_period_filter(env):
+    s3, config, _ = env
+    code, out = run(s3, config, ["list", "--user-id", "000002", "--since", TODAY.isoformat()])
+    assert "SAT0202301" in out
+    code, out = run(s3, config, ["list", "--user-id", "000002", "--until", YESTERDAY.isoformat()])
+    assert "該当する結果フォルダはありません" in out
+
+
+def test_in_period_basis():
+    utc = datetime.timezone.utc
+    folder = s3_move.ResultFolder("checked", "R", "p/", objects=[
+        {"Key": "p/a.pdf", "Size": 1, "LastModified": datetime.datetime(2025, 1, 10, 0, 0, tzinfo=utc)},
+        {"Key": "p/a.csv", "Size": 1, "LastModified": datetime.datetime(2025, 3, 31, 16, 0, tzinfo=utc)},
+    ])
+    d = datetime.date
+    # 最終アップロードは JST で 2025-04-01 01:00
+    assert s3_move.in_period(folder, d(2025, 4, 1), None, "last", JST)
+    assert not s3_move.in_period(folder, None, d(2025, 3, 31), "last", JST)
+    assert s3_move.in_period(folder, None, d(2025, 1, 10), "first", JST)
+    assert not s3_move.in_period(folder, d(2025, 1, 11), None, "first", JST)
+
+
+def test_move_with_period_filter(env):
+    s3, config, _ = env
+    before = keys(s3)
+    code, out = run(s3, config, BASE + ["--until", YESTERDAY.isoformat(), "--execute"])
+    assert code == 0
+    assert "移動対象の結果フォルダはありません" in out
+    assert keys(s3) == before
+
+
+def test_bulk_move_from_list(env):
+    s3, config, tmp = env
+    path = tmp / "list.csv"
+    run(s3, config, ["list", "--user-id", "000002", "-o", str(path)])
+    # SAT0202302 の行を削除 (不要な行を消す運用)
+    lines = path.read_text(encoding="utf-8-sig").splitlines()
+    path.write_text("\n".join(l for l in lines if "SAT0202302" not in l) + "\n", encoding="utf-8-sig")
+
+    code, out = run(s3, config, ["move", "--list", str(path), "--dst-user-id", "000003"])
+    assert code == 0 and "ドライラン" in out
+
+    code, out = run(s3, config, ["move", "--list", str(path), "--dst-user-id", "000003", "--execute"],
+                    CONFIRM)  # 番号選択なし
+    assert code == 0, out
+    k = keys(s3)
+    assert f"private/{ID_B}/000003/checked/SAT0202301/report.pdf" in k
+    assert f"private/{ID_B}/000003/unchecked/SAT0202303/data.csv" in k
+    assert f"private/{ID_A}/000002/checked/SAT0202302/report.pdf" in k
+
+
+def test_bulk_move_skips_changed_and_conflicting(env):
+    s3, config, tmp = env
+    path = tmp / "list.csv"
+    run(s3, config, ["list", "--user-id", "000002", "-o", str(path)])
+    s3.put_object(Bucket=BUCKET, Key=f"private/{ID_A}/000002/unchecked/SAT0202303/new.pdf", Body=b"x")
+    code, out = run(s3, config, ["move", "--list", str(path), "--dst-user-id", "000003", "--execute"],
+                    CONFIRM)
+    assert code == 0, out
+    assert "ファイル数が変わっています" in out
+    assert "移動先に同名フォルダがあります" in out
+    k = keys(s3)
+    assert f"private/{ID_B}/000003/checked/SAT0202301/report.pdf" in k
+    assert f"private/{ID_A}/000002/unchecked/SAT0202303/data.csv" in k  # 変化したので移動しない
+    assert f"private/{ID_A}/000002/checked/SAT0202302/report.pdf" in k  # 衝突したので移動しない
+
+
+def test_bulk_move_list_with_multiple_sources_rejected(env):
+    s3, config, tmp = env
+    path = tmp / "list.csv"
+    path.write_text(
+        "identity_id,user_id,status,folder\n"
+        f"{ID_A},000002,checked,SAT0202301\n"
+        f"{ID_B},000003,checked,SAT0202302\n", encoding="utf-8")
+    with pytest.raises(s3_move.MoveError, match="複数の移動元"):
+        run(s3, config, ["move", "--list", str(path), "--dst-identity-id", ID_C, "--dst-user-id", "000004"])
+
+
+def test_bulk_move_src_mismatch_rejected(env):
+    s3, config, tmp = env
+    path = tmp / "list.csv"
+    run(s3, config, ["list", "--user-id", "000002", "-o", str(path)])
+    with pytest.raises(s3_move.MoveError, match="一致しません"):
+        run(s3, config, ["move", "--list", str(path), "--src-user-id", "000009", "--dst-user-id", "000003"])

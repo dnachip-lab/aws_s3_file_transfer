@@ -5,17 +5,19 @@ S3 の構成:
     {bucket}/private/{Identity ID}/{ユーザーID}/{checked|unchecked}/{結果フォルダ}/*.pdf, *.csv
     例: private/ap-northeast-1:05efdd85-9e44-4765-90e4-d8a9138bb7da/000002/checked/SAT0202301/
 
-あるユーザーID / Identity ID の checked / unchecked フォルダ配下にある
-結果フォルダを、別のユーザーID / Identity ID の同じ checked / unchecked
-フォルダへ、確認しながら移動する。
-ユーザーID と Identity ID はどちらか一方だけ指定すれば、もう一方を S3 から特定する。
+サブコマンド:
+    search  Identity ID またはユーザーID で対象フォルダを検索する
+    list    移動対象となる結果フォルダ (PDF / CSV を含む) の一覧を、アップロード日などの
+            情報付きで表示する。期間指定で絞り込み、CSV に保存できる
+    move    結果フォルダを別のユーザーID / Identity ID の同じ checked / unchecked フォルダへ
+            確認しながら移動する。期間指定、または list で保存した CSV による一括移動ができる
 
-安全のための方針:
+move の安全方針:
   * 既定はドライラン。--execute を付けたときだけ実際に移動する。
-  * 移動元と移動先が同一なら中止。
-  * ID から相手側の ID が一意に決まらない場合は中止。
+  * 移動元と移動先が同一なら中止。ID から相手側の ID が一意に決まらない場合も中止。
   * 移動先のフォルダが S3 上に存在しなければ中止 (ID の打ち間違い対策)。
-  * 移動先に同名の結果フォルダ / 同名ファイルがある場合は上書きせずスキップ。
+  * 移動先に同名の結果フォルダ / 同名ファイルがある場合は上書きせず対象外にする。
+  * 一覧 CSV 作成後にファイル数が変わったフォルダは対象外にする。
   * 実行前に移動計画を表示し、移動先のユーザーID と Identity ID 末尾の再入力、
     "yes" の入力を求める。
   * コピー後にサイズを検証し、フォルダ内の全ファイルの検証が済んでから
@@ -24,6 +26,7 @@ S3 の構成:
 """
 
 import argparse
+import csv
 import datetime
 import json
 import os
@@ -35,7 +38,11 @@ STATUSES = ("checked", "unchecked")
 DELETE_BATCH = 1000
 CONFIRM_SUFFIX_LEN = 6
 DEFAULT_ROOT_PREFIX = "private/"
+DEFAULT_EXTENSIONS = (".pdf", ".csv")
+DEFAULT_UTC_OFFSET_HOURS = 9
 DEFAULT_IDENTITY_PATTERN = r"^[a-z]{2}(-[a-z]+)+-\d+:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+LIST_COLUMNS = ["identity_id", "user_id", "status", "folder", "pdf_count", "csv_count",
+                "other_count", "file_count", "total_size", "first_uploaded", "last_uploaded"]
 
 
 class MoveError(Exception):
@@ -57,13 +64,21 @@ class ResultFolder:
     status: str
     name: str
     src_prefix: str
-    dst_prefix: str
     objects: list = field(default_factory=list)
-    dst_exists: bool = False
+    dst_prefix: str = ""
+    blocked: str = ""  # 移動できない理由 (空なら移動可)
 
     @property
     def total_size(self):
         return sum(o["Size"] for o in self.objects)
+
+    @property
+    def first_uploaded(self):
+        return min((o["LastModified"] for o in self.objects), default=None)
+
+    @property
+    def last_uploaded(self):
+        return max((o["LastModified"] for o in self.objects), default=None)
 
     def ext_counts(self):
         counts = {}
@@ -71,6 +86,15 @@ class ResultFolder:
             ext = os.path.splitext(o["Key"])[1].lower() or "(なし)"
             counts[ext] = counts.get(ext, 0) + 1
         return counts
+
+    def count_of(self, ext):
+        return self.ext_counts().get(ext, 0)
+
+    def other_count(self, expected_exts):
+        return sum(v for k, v in self.ext_counts().items() if k not in expected_exts)
+
+    def has_targets(self, expected_exts):
+        return any(self.count_of(e) for e in expected_exts)
 
 
 # ---------------------------------------------------------------- 設定 / パス
@@ -81,6 +105,10 @@ def load_config(path):
     root = config.get("root_prefix", DEFAULT_ROOT_PREFIX)
     config["root_prefix"] = root if root.endswith("/") else root + "/"
     config.setdefault("identity_id_pattern", DEFAULT_IDENTITY_PATTERN)
+    config["expected_extensions"] = [
+        e.lower() for e in config.get("expected_extensions", DEFAULT_EXTENSIONS)]
+    config["tz"] = datetime.timezone(
+        datetime.timedelta(hours=config.get("utc_offset_hours", DEFAULT_UTC_OFFSET_HOURS)))
     return config
 
 
@@ -104,12 +132,35 @@ def validate_identity_id(value, pattern):
     return value
 
 
+def validated_ids(config, user_id, identity_id):
+    return (validate_user_id(user_id) if user_id else None,
+            validate_identity_id(identity_id, config["identity_id_pattern"]) if identity_id else None)
+
+
 def owner_prefix(config, owner):
     return f"{config['root_prefix']}{owner.identity_id}/{owner.user_id}/"
 
 
 def status_prefix(config, owner, status):
     return f"{owner_prefix(config, owner)}{status}/"
+
+
+def parse_date(value):
+    try:
+        return datetime.date.fromisoformat(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"日付は YYYY-MM-DD 形式で指定してください: {value}")
+
+
+def format_dt(dt, tz):
+    return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S") if dt else ""
+
+
+def format_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
 
 
 # ---------------------------------------------------------------- S3 操作
@@ -127,7 +178,10 @@ def list_objects(s3, bucket, prefix):
     objects = []
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
         for o in page.get("Contents", []):
-            objects.append({"Key": o["Key"], "Size": o["Size"], "ETag": o.get("ETag")})
+            if o["Key"].endswith("/"):  # コンソールで作成したフォルダのマーカー
+                continue
+            objects.append({"Key": o["Key"], "Size": o["Size"],
+                            "LastModified": o["LastModified"]})
     return objects
 
 
@@ -152,85 +206,176 @@ def owner_has_results(s3, bucket, config, owner):
     return any(prefix_exists(s3, bucket, status_prefix(config, owner, st)) for st in STATUSES)
 
 
-# ---------------------------------------------------------------- ID の特定
+# ---------------------------------------------------------------- 検索 / ID の特定
 
-def resolve_owner(s3, bucket, config, label, user_id, identity_id, out):
-    """ユーザーID / Identity ID の片方しか指定されていなければ、もう片方を S3 から特定する。"""
+def find_owners(s3, bucket, config, user_id=None, identity_id=None):
+    """ユーザーID / Identity ID に該当する持ち主をすべて返す。"""
     root = config["root_prefix"]
     if user_id and identity_id:
-        return Owner(identity_id, user_id)
-
+        exists = prefix_exists(s3, bucket, f"{root}{identity_id}/{user_id}/")
+        return [Owner(identity_id, user_id)] if exists else []
     if identity_id:
-        users = list_subfolders(s3, bucket, f"{root}{identity_id}/")
-        if not users:
-            raise MoveError(f"{label}の Identity ID のフォルダが見つかりません: {root}{identity_id}/")
-        if len(users) > 1:
-            raise MoveError(
-                f"{label}の Identity ID 配下に複数のユーザーID があります: {', '.join(users)}\n"
-                f"ユーザーID も指定してください。")
-        print(f"{label}のユーザーID を特定しました: {users[0]}", file=out)
-        return Owner(identity_id, users[0])
+        return [Owner(identity_id, u) for u in list_subfolders(s3, bucket, f"{root}{identity_id}/")]
+    return [Owner(ident, user_id) for ident in list_subfolders(s3, bucket, root)
+            if prefix_exists(s3, bucket, f"{root}{ident}/{user_id}/")]
 
-    print(f"{label}のユーザーID {user_id} の Identity ID を検索しています...", file=out)
-    matches = [ident for ident in list_subfolders(s3, bucket, root)
-               if prefix_exists(s3, bucket, f"{root}{ident}/{user_id}/")]
+
+def resolve_owner(s3, bucket, config, label, user_id, identity_id, out):
+    """ユーザーID / Identity ID から持ち主を 1 つに特定する。一意に決まらなければ中止。"""
+    if user_id and identity_id:
+        return Owner(identity_id, user_id)
+    if user_id:
+        print(f"{label}のユーザーID {user_id} の Identity ID を検索しています...", file=out)
+    matches = find_owners(s3, bucket, config, user_id, identity_id)
+    given = f"ユーザーID {user_id}" if user_id else f"Identity ID {identity_id}"
     if not matches:
-        raise MoveError(f"{label}のユーザーID が見つかりません: {user_id}")
+        raise MoveError(f"{label}の{given} が見つかりません")
     if len(matches) > 1:
+        other = "Identity ID" if user_id else "ユーザーID"
+        found = ", ".join(m.identity_id if user_id else m.user_id for m in matches)
         raise MoveError(
-            f"{label}のユーザーID {user_id} が複数の Identity ID 配下にあります: {', '.join(matches)}\n"
-            f"Identity ID も指定してください。")
-    print(f"{label}の Identity ID を特定しました: {matches[0]}", file=out)
-    return Owner(matches[0], user_id)
+            f"{label}の{given} に該当する{other}が複数あります: {found}\n"
+            f"{other}も指定してください。")
+    owner = matches[0]
+    if user_id:
+        print(f"{label}の Identity ID を特定しました: {owner.identity_id}", file=out)
+    else:
+        print(f"{label}のユーザーID を特定しました: {owner.user_id}", file=out)
+    return owner
 
 
-# ---------------------------------------------------------------- 計画
+# ---------------------------------------------------------------- 結果フォルダの収集
 
-def build_plan(s3, bucket, config, src, dst, statuses, folder_names=None):
-    plan = []
+def load_folder(s3, bucket, config, owner, status, name):
+    prefix = f"{status_prefix(config, owner, status)}{name}/"
+    return ResultFolder(status=status, name=name, src_prefix=prefix,
+                        objects=list_objects(s3, bucket, prefix))
+
+
+def collect_folders(s3, bucket, config, owner, statuses, folder_names=None):
+    """移動対象となる結果フォルダ (PDF / CSV を含むもの) を返す。"""
+    folders = []
     for status in statuses:
-        src_prefix = status_prefix(config, src, status)
-        dst_prefix = status_prefix(config, dst, status)
-        for name in list_subfolders(s3, bucket, src_prefix):
+        for name in list_subfolders(s3, bucket, status_prefix(config, owner, status)):
             if folder_names and name not in folder_names:
                 continue
-            folder = ResultFolder(
-                status=status,
-                name=name,
-                src_prefix=f"{src_prefix}{name}/",
-                dst_prefix=f"{dst_prefix}{name}/",
-            )
-            folder.objects = list_objects(s3, bucket, folder.src_prefix)
-            folder.dst_exists = prefix_exists(s3, bucket, folder.dst_prefix)
-            plan.append(folder)
-    return plan
+            folder = load_folder(s3, bucket, config, owner, status, name)
+            if folder.has_targets(config["expected_extensions"]):
+                folders.append(folder)
+    return folders
 
 
-def format_size(n):
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
-            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
-        n /= 1024
+def in_period(folder, since, until, basis, tz):
+    dt = folder.last_uploaded if basis == "last" else folder.first_uploaded
+    if dt is None:
+        return False
+    d = dt.astimezone(tz).date()
+    return (since is None or d >= since) and (until is None or d <= until)
 
 
-def print_plan(plan, expected_exts, out=sys.stdout):
+def filter_period(folders, args, config):
+    if not (args.since or args.until):
+        return folders
+    return [f for f in folders
+            if in_period(f, args.since, args.until, args.date_basis, config["tz"])]
+
+
+def period_text(args):
+    if not (args.since or args.until):
+        return "指定なし"
+    basis = "最終アップロード日" if args.date_basis == "last" else "最初のアップロード日"
+    return f"{basis}が {args.since or ''} 〜 {args.until or ''}"
+
+
+# ---------------------------------------------------------------- 一覧ファイル
+
+def write_list_csv(path, owner, folders, config):
+    exts = config["expected_extensions"]
+    # Excel で開けるように BOM 付き UTF-8
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=LIST_COLUMNS)
+        w.writeheader()
+        for folder in folders:
+            w.writerow({
+                "identity_id": owner.identity_id,
+                "user_id": owner.user_id,
+                "status": folder.status,
+                "folder": folder.name,
+                "pdf_count": folder.count_of(".pdf"),
+                "csv_count": folder.count_of(".csv"),
+                "other_count": folder.other_count(exts),
+                "file_count": len(folder.objects),
+                "total_size": folder.total_size,
+                "first_uploaded": format_dt(folder.first_uploaded, config["tz"]),
+                "last_uploaded": format_dt(folder.last_uploaded, config["tz"]),
+            })
+
+
+def read_list_csv(path, config):
+    """一覧 CSV を読み、(持ち主, [(status, folder, file_count)]) を返す。"""
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        raise MoveError(f"一覧ファイルに行がありません: {path}")
+    missing = {"identity_id", "user_id", "status", "folder"} - set(rows[0])
+    if missing:
+        raise MoveError(f"一覧ファイルに必要な列がありません: {', '.join(sorted(missing))}")
+
+    owners = set()
+    entries = []
+    for i, row in enumerate(rows, 2):
+        user_id, identity_id = validated_ids(config, row["user_id"], row["identity_id"])
+        if not (user_id and identity_id):
+            raise MoveError(f"一覧ファイル {i} 行目: identity_id と user_id は必須です")
+        status = row["status"].strip()
+        if status not in STATUSES:
+            raise MoveError(f"一覧ファイル {i} 行目: status が不正です: {status!r}")
+        name = row["folder"].strip()
+        if not name or "/" in name:
+            raise MoveError(f"一覧ファイル {i} 行目: folder が不正です: {name!r}")
+        count = row.get("file_count", "").strip()
+        owners.add(Owner(identity_id, user_id))
+        entries.append((status, name, int(count) if count else None))
+    if len(owners) > 1:
+        raise MoveError("一覧ファイルに複数の移動元 (ユーザーID / Identity ID) が含まれています。"
+                        "移動元ごとにファイルを分けてください。")
+    if len({(s, n) for s, n, _ in entries}) != len(entries):
+        raise MoveError("一覧ファイルに同じフォルダが重複しています")
+    return owners.pop(), entries
+
+
+# ---------------------------------------------------------------- 表示
+
+def print_folder_table(folders, config, out):
+    exts = config["expected_extensions"]
+    tz = config["tz"]
+    print(f"  {'No':>4}  {'状態':<9} {'結果フォルダ':<20} {'PDF':>4} {'CSV':>4} {'他':>3} "
+          f"{'サイズ':>9}  {'最初のアップロード':<19}  {'最終アップロード':<19}", file=out)
+    for i, f in enumerate(folders, 1):
+        print(f"  {i:>4}. {f.status:<9} {f.name:<20} {f.count_of('.pdf'):>4} {f.count_of('.csv'):>4} "
+              f"{f.other_count(exts):>3} {format_size(f.total_size):>9}  "
+              f"{format_dt(f.first_uploaded, tz):<19}  {format_dt(f.last_uploaded, tz):<19}", file=out)
+
+
+def print_plan(plan, config, out):
+    exts = config["expected_extensions"]
+    tz = config["tz"]
     for i, f in enumerate(plan, 1):
-        exts = ", ".join(f"{k}:{v}" for k, v in sorted(f.ext_counts().items()))
-        mark = "  [移動不可: 移動先に同名フォルダあり]" if f.dst_exists else ""
-        print(f"  {i:>3}. [{f.status}] {f.name}  ({len(f.objects)}件 {format_size(f.total_size)} / {exts}){mark}",
-              file=out)
+        counts = ", ".join(f"{k}:{v}" for k, v in sorted(f.ext_counts().items()))
+        mark = f"  [移動不可: {f.blocked}]" if f.blocked else ""
+        print(f"  {i:>3}. [{f.status}] {f.name}  ({len(f.objects)}件 {format_size(f.total_size)} / "
+              f"{counts} / 最終アップロード {format_dt(f.last_uploaded, tz)}){mark}", file=out)
         print(f"         移動元: {f.src_prefix}", file=out)
         print(f"         移動先: {f.dst_prefix}", file=out)
-        unexpected = [e for e in f.ext_counts() if expected_exts and e not in expected_exts]
-        if unexpected:
-            print(f"         ※注意: PDF/CSV 以外のファイルを含みます ({', '.join(unexpected)})", file=out)
+        if f.other_count(exts):
+            others = [e for e in f.ext_counts() if e not in exts]
+            print(f"         ※注意: PDF/CSV 以外のファイルを含みます ({', '.join(others)})", file=out)
 
 
 def parse_selection(text, plan):
     text = text.strip().lower()
-    movable = [i for i, f in enumerate(plan, 1) if not f.dst_exists]
     if text == "all":
-        return movable
+        return [i for i, f in enumerate(plan, 1) if not f.blocked]
     selected = []
     for part in text.replace(" ", "").split(","):
         if not part:
@@ -243,8 +388,8 @@ def parse_selection(text, plan):
         for n in nums:
             if n < 1 or n > len(plan):
                 raise ValueError(f"範囲外の番号です: {n}")
-            if plan[n - 1].dst_exists:
-                raise ValueError(f"{n} は移動先に同名フォルダがあるため選択できません")
+            if plan[n - 1].blocked:
+                raise ValueError(f"{n} は選択できません ({plan[n - 1].blocked})")
             if n not in selected:
                 selected.append(n)
     return selected
@@ -290,68 +435,76 @@ def write_log(log_dir, meta, entries):
     return path
 
 
-# ---------------------------------------------------------------- CLI
+# ---------------------------------------------------------------- サブコマンド
 
-def parse_args(argv):
-    p = argparse.ArgumentParser(
-        description="S3 上の結果フォルダを別のユーザーID / Identity ID のフォルダへ確認しながら移動します。"
-                    "各 ID はどちらか一方だけの指定でも構いません。")
-    p.add_argument("--config", default="config.json", help="設定ファイル (既定: config.json)")
-    p.add_argument("--bucket", help="バケット名 (設定ファイルより優先)")
-    p.add_argument("--profile", help="AWS プロファイル名")
-    p.add_argument("--region", help="AWS リージョン")
-    p.add_argument("--src-user-id", help="移動元のユーザーID (例: 000002)")
-    p.add_argument("--src-identity-id", help="移動元の Identity ID (例: ap-northeast-1:05efdd85-...)")
-    p.add_argument("--dst-user-id", help="移動先のユーザーID")
-    p.add_argument("--dst-identity-id", help="移動先の Identity ID")
-    p.add_argument("--status", choices=STATUSES + ("both",), default="both",
-                   help="対象フォルダ (checked / unchecked / both、既定: both)")
-    p.add_argument("--folder", action="append", dest="folders",
-                   help="対象の結果フォルダ名 (例: SAT0202301。複数指定可。省略時は一覧から選択)")
-    p.add_argument("--allow-new-destination", action="store_true",
-                   help="移動先のフォルダが存在しなくても続行する (通常は使わないこと)")
-    p.add_argument("--execute", action="store_true",
-                   help="実際に移動する。省略時はドライラン (計画の表示のみ)")
-    args = p.parse_args(argv)
-    if not (args.src_user_id or args.src_identity_id):
-        p.error("--src-user-id か --src-identity-id の少なくとも一方を指定してください")
-    if not (args.dst_user_id or args.dst_identity_id):
-        p.error("--dst-user-id か --dst-identity-id の少なくとも一方を指定してください")
-    return args
+def cmd_search(args, config, s3, bucket, input_func, out):
+    user_id, identity_id = validated_ids(config, args.user_id, args.identity_id)
+    owners = find_owners(s3, bucket, config, user_id, identity_id)
+    if not owners:
+        print("該当するフォルダは見つかりませんでした。", file=out)
+        return 1
+    print(f"{len(owners)} 件見つかりました:", file=out)
+    for o in owners:
+        counts = []
+        for st in STATUSES:
+            n = len(collect_folders(s3, bucket, config, o, (st,)))
+            counts.append(f"{st}: {n}")
+        print(f"  ユーザーID={o.user_id}  Identity ID={o.identity_id}  "
+              f"(移動対象フォルダ {', '.join(counts)})", file=out)
+        print(f"    {owner_prefix(config, o)}", file=out)
+    return 0
 
 
-def make_client(args, config):
-    import boto3
-    session = boto3.Session(profile_name=args.profile) if args.profile else boto3.Session()
-    return session.client("s3", region_name=args.region or config.get("region"))
-
-
-def run(argv=None, s3=None, input_func=input, out=sys.stdout):
-    args = parse_args(argv)
-    config = load_config(args.config)
-    bucket = args.bucket or config.get("bucket")
-    if not bucket:
-        raise MoveError("バケット名が指定されていません (--bucket または設定ファイルの bucket)")
-    pattern = config["identity_id_pattern"]
-
-    def ids(user_id, identity_id):
-        return (validate_user_id(user_id) if user_id else None,
-                validate_identity_id(identity_id, pattern) if identity_id else None)
-
-    src_user, src_ident = ids(args.src_user_id, args.src_identity_id)
-    dst_user, dst_ident = ids(args.dst_user_id, args.dst_identity_id)
+def cmd_list(args, config, s3, bucket, input_func, out):
+    user_id, identity_id = validated_ids(config, args.user_id, args.identity_id)
+    owner = resolve_owner(s3, bucket, config, "対象", user_id, identity_id, out)
     statuses = STATUSES if args.status == "both" else (args.status,)
-    expected_exts = [e.lower() for e in config.get("expected_extensions", [".pdf", ".csv"])]
+    folders = filter_period(collect_folders(s3, bucket, config, owner, statuses), args, config)
 
-    s3 = s3 or make_client(args, config)
+    print(f"対象     : {owner}", file=out)
+    print(f"フォルダ : {', '.join(statuses)}", file=out)
+    print(f"期間     : {period_text(args)}", file=out)
+    print("", file=out)
+    if not folders:
+        print("該当する結果フォルダはありません。", file=out)
+        return 0
+    print_folder_table(folders, config, out)
+    print("", file=out)
+    print(f"{len(folders)} フォルダ / {sum(len(f.objects) for f in folders)} ファイル / "
+          f"{format_size(sum(f.total_size for f in folders))}", file=out)
+    if args.output:
+        write_list_csv(args.output, owner, folders, config)
+        print(f"一覧を保存しました: {args.output}", file=out)
+        print("不要な行を削除してから move --list で一括移動できます。", file=out)
+    return 0
+
+
+def cmd_move(args, config, s3, bucket, input_func, out):
+    statuses = STATUSES if args.status == "both" else (args.status,)
+    dst_user, dst_ident = validated_ids(config, args.dst_user_id, args.dst_identity_id)
 
     print(f"バケット : {bucket}", file=out)
     print(f"モード   : {'実行' if args.execute else 'ドライラン (変更しません)'}", file=out)
-    src = resolve_owner(s3, bucket, config, "移動元", src_user, src_ident, out)
+
+    entries = None
+    if args.list:
+        src, entries = read_list_csv(args.list, config)
+        src_user, src_ident = validated_ids(config, args.src_user_id, args.src_identity_id)
+        if (src_user and src_user != src.user_id) or (src_ident and src_ident != src.identity_id):
+            raise MoveError(f"指定した移動元と一覧ファイルの移動元が一致しません: 一覧ファイル {src}")
+        print(f"一覧     : {args.list} ({len(entries)} フォルダ)", file=out)
+    else:
+        src_user, src_ident = validated_ids(config, args.src_user_id, args.src_identity_id)
+        if not (src_user or src_ident):
+            raise MoveError("--src-user-id か --src-identity-id、または --list を指定してください")
+        src = resolve_owner(s3, bucket, config, "移動元", src_user, src_ident, out)
     dst = resolve_owner(s3, bucket, config, "移動先", dst_user, dst_ident, out)
+
     print(f"移動元   : {src}", file=out)
     print(f"移動先   : {dst}", file=out)
-    print(f"対象     : {', '.join(statuses)}", file=out)
+    if not args.list:
+        print(f"対象     : {', '.join(statuses)}", file=out)
+        print(f"期間     : {period_text(args)}", file=out)
     print("", file=out)
 
     if src == dst:
@@ -367,43 +520,67 @@ def run(argv=None, s3=None, input_func=input, out=sys.stdout):
         print(f"※警告: 移動先のフォルダは存在しません。新規に作成されます: {owner_prefix(config, dst)}",
               file=out)
 
-    plan = build_plan(s3, bucket, config, src, dst, statuses, args.folders)
-    if args.folders:
-        missing = sorted(set(args.folders) - {f.name for f in plan})
-        if missing:
-            raise MoveError(f"指定された結果フォルダが移動元にありません: {', '.join(missing)}")
+    # 計画の作成
+    if entries is not None:
+        plan = []
+        for status, name, expected_count in entries:
+            folder = load_folder(s3, bucket, config, src, status, name)
+            if not folder.objects:
+                folder.blocked = "移動元にフォルダがありません"
+            elif expected_count is not None and expected_count != len(folder.objects):
+                folder.blocked = (f"一覧作成後にファイル数が変わっています "
+                                  f"({expected_count} → {len(folder.objects)})")
+            plan.append(folder)
+    else:
+        plan = collect_folders(s3, bucket, config, src, statuses, args.folders)
+        if args.folders:
+            missing = sorted(set(args.folders) - {f.name for f in plan})
+            if missing:
+                raise MoveError(f"指定された結果フォルダが移動元にありません (PDF/CSV を含むもの): "
+                                f"{', '.join(missing)}")
+        plan = filter_period(plan, args, config)
+    for f in plan:
+        f.dst_prefix = f"{status_prefix(config, dst, f.status)}{f.name}/"
+        if not f.blocked and prefix_exists(s3, bucket, f.dst_prefix):
+            f.blocked = "移動先に同名フォルダがあります"
+
     if not plan:
         print("移動対象の結果フォルダはありません。", file=out)
         return 0
 
-    print("移動元の結果フォルダ:", file=out)
-    print_plan(plan, expected_exts, out)
+    print("移動対象の結果フォルダ:", file=out)
+    print_plan(plan, config, out)
     print("", file=out)
+    blocked = [f for f in plan if f.blocked]
+    if blocked:
+        print(f"※ {len(blocked)} フォルダは移動できないため対象外になります。", file=out)
 
     if not args.execute:
         print("ドライランのため終了します。実際に移動するには --execute を付けて実行してください。", file=out)
         return 0
 
-    if all(f.dst_exists for f in plan):
-        print("移動できる結果フォルダがありません (すべて移動先に同名フォルダがあります)。", file=out)
+    if len(blocked) == len(plan):
+        print("移動できる結果フォルダがありません。", file=out)
         return 1
 
-    # 1. 対象の選択
-    while True:
-        text = input_func("移動するフォルダの番号を入力してください (例: 1,3,5-7 / all / q で中止): ")
-        if text.strip().lower() == "q":
-            print("中止しました。", file=out)
-            return 1
-        try:
-            selected = parse_selection(text, plan)
-        except ValueError as e:
-            print(f"  入力エラー: {e}", file=out)
-            continue
-        if selected:
-            break
-        print("  1 つ以上選択してください。", file=out)
-
-    targets = [plan[n - 1] for n in selected]
+    # 1. 対象の選択 (一覧ファイル指定時は一覧の全フォルダ)
+    if entries is not None:
+        targets = [f for f in plan if not f.blocked]
+    else:
+        while True:
+            text = input_func("移動するフォルダの番号を入力してください (例: 1,3,5-7 / all / q で中止): ")
+            if text.strip().lower() == "q":
+                print("中止しました。", file=out)
+                return 1
+            try:
+                selected = parse_selection(text, plan)
+            except ValueError as e:
+                print(f"  入力エラー: {e}", file=out)
+                continue
+            if selected:
+                break
+            print("  1 つ以上選択してください。", file=out)
+        targets = [plan[n - 1] for n in selected]
 
     # 2. 最終確認
     print("", file=out)
@@ -411,8 +588,10 @@ def run(argv=None, s3=None, input_func=input, out=sys.stdout):
     print("以下の内容で移動します。移動先に間違いがないか必ず確認してください。", file=out)
     print(f"  移動元: {src}", file=out)
     print(f"  移動先: {dst}", file=out)
+    print(f"  件数  : {len(targets)} フォルダ / {sum(len(f.objects) for f in targets)} ファイル / "
+          f"{format_size(sum(f.total_size for f in targets))}", file=out)
     print("=" * 70, file=out)
-    print_plan(targets, expected_exts, out)
+    print_plan(targets, config, out)
     print("", file=out)
 
     typed = input_func("確認のため、移動先のユーザーID を入力してください: ")
@@ -433,15 +612,18 @@ def run(argv=None, s3=None, input_func=input, out=sys.stdout):
     meta = {"bucket": bucket,
             "src": {"identity_id": src.identity_id, "user_id": src.user_id},
             "dst": {"identity_id": dst.identity_id, "user_id": dst.user_id},
+            "list_file": args.list,
             "started": now_iso(),
             "folders": [{"status": f.status, "name": f.name, "src": f.src_prefix,
                          "dst": f.dst_prefix} for f in targets]}
     failed = None
+    done = 0
     try:
-        for f in targets:
-            print(f"移動中: [{f.status}] {f.name} ...", end=" ", file=out, flush=True)
+        for i, f in enumerate(targets, 1):
+            print(f"移動中 ({i}/{len(targets)}): [{f.status}] {f.name} ...", end=" ", file=out, flush=True)
             try:
                 move_folder(s3, bucket, f, log)
+                done += 1
                 print("完了", file=out)
             except Exception as e:  # 1 フォルダの失敗で残りを続けず停止する
                 print("失敗", file=out)
@@ -456,12 +638,90 @@ def run(argv=None, s3=None, input_func=input, out=sys.stdout):
 
     if failed:
         f, e = failed
-        print(f"エラーのため処理を中断しました: {e}", file=out)
+        print(f"エラーのため処理を中断しました ({done}/{len(targets)} フォルダ完了): {e}", file=out)
         print(f"失敗したフォルダ [{f.status}] {f.name} の移動元ファイルは削除されていません。"
               "移動先にコピー済みのファイルは操作ログで確認してください。", file=out)
         return 2
     print(f"{len(targets)} フォルダの移動が完了しました。", file=out)
     return 0
+
+
+# ---------------------------------------------------------------- CLI
+
+def parse_args(argv):
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--config", default="config.json", help="設定ファイル (既定: config.json)")
+    common.add_argument("--bucket", help="バケット名 (設定ファイルより優先)")
+    common.add_argument("--profile", help="AWS プロファイル名")
+    common.add_argument("--region", help="AWS リージョン")
+
+    period = argparse.ArgumentParser(add_help=False)
+    period.add_argument("--status", choices=STATUSES + ("both",), default="both",
+                        help="対象フォルダ (checked / unchecked / both、既定: both)")
+    period.add_argument("--since", type=parse_date, help="アップロード日がこの日以降 (YYYY-MM-DD)")
+    period.add_argument("--until", type=parse_date, help="アップロード日がこの日以前 (YYYY-MM-DD)")
+    period.add_argument("--date-basis", choices=("last", "first"), default="last",
+                        help="期間判定に使う日付: フォルダ内の最終 (last) / 最初 (first) のアップロード日 "
+                             "(既定: last)")
+
+    p = argparse.ArgumentParser(
+        description="S3 上の結果フォルダ (PDF / CSV) を検索・一覧表示し、"
+                    "別のユーザーID / Identity ID のフォルダへ確認しながら移動します。")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    sp = sub.add_parser("search", parents=[common], help="ユーザーID / Identity ID で対象フォルダを検索")
+    sp.add_argument("--user-id", help="ユーザーID (例: 000002)")
+    sp.add_argument("--identity-id", help="Identity ID (例: ap-northeast-1:05efdd85-...)")
+
+    lp = sub.add_parser("list", parents=[common, period],
+                        help="移動対象となる結果フォルダの一覧 (アップロード日付き) を表示・保存")
+    lp.add_argument("--user-id", help="ユーザーID")
+    lp.add_argument("--identity-id", help="Identity ID")
+    lp.add_argument("--output", "-o", help="一覧を CSV ファイルに保存する")
+
+    mp = sub.add_parser("move", parents=[common, period], help="結果フォルダを確認しながら移動")
+    mp.add_argument("--src-user-id", help="移動元のユーザーID")
+    mp.add_argument("--src-identity-id", help="移動元の Identity ID")
+    mp.add_argument("--dst-user-id", help="移動先のユーザーID")
+    mp.add_argument("--dst-identity-id", help="移動先の Identity ID")
+    mp.add_argument("--folder", action="append", dest="folders",
+                    help="対象の結果フォルダ名 (例: SAT0202301。複数指定可。省略時は一覧から選択)")
+    mp.add_argument("--list", help="list -o で保存した一覧 CSV に含まれるフォルダを一括移動する")
+    mp.add_argument("--allow-new-destination", action="store_true",
+                    help="移動先のフォルダが存在しなくても続行する (通常は使わないこと)")
+    mp.add_argument("--execute", action="store_true",
+                    help="実際に移動する。省略時はドライラン (計画の表示のみ)")
+
+    args = p.parse_args(argv)
+    if args.command in ("search", "list") and not (args.user_id or args.identity_id):
+        p.error("--user-id か --identity-id の少なくとも一方を指定してください")
+    if args.command == "move":
+        if not (args.dst_user_id or args.dst_identity_id):
+            p.error("--dst-user-id か --dst-identity-id の少なくとも一方を指定してください")
+        if args.list and (args.folders or args.since or args.until or args.status != "both"):
+            p.error("--list と --folder / --since / --until / --status は同時に指定できません")
+    if getattr(args, "since", None) and getattr(args, "until", None) and args.since > args.until:
+        p.error("--since は --until 以前の日付を指定してください")
+    return args
+
+
+def make_client(args, config):
+    import boto3
+    session = boto3.Session(profile_name=args.profile) if args.profile else boto3.Session()
+    return session.client("s3", region_name=args.region or config.get("region"))
+
+
+COMMANDS = {"search": cmd_search, "list": cmd_list, "move": cmd_move}
+
+
+def run(argv=None, s3=None, input_func=input, out=sys.stdout):
+    args = parse_args(argv)
+    config = load_config(args.config)
+    bucket = args.bucket or config.get("bucket")
+    if not bucket:
+        raise MoveError("バケット名が指定されていません (--bucket または設定ファイルの bucket)")
+    s3 = s3 or make_client(args, config)
+    return COMMANDS[args.command](args, config, s3, bucket, input_func, out)
 
 
 def main():
