@@ -786,7 +786,8 @@ AWS_ERROR_HINTS = {
 def explain_aws_error(e, profile, bucket):
     """boto3 / botocore の例外を、原因と対処を書いた MoveError に変換する。"""
     from botocore import exceptions as bex
-    profile = profile or "(既定)"
+    no_profile = not profile
+    profile = profile or "default"
     if isinstance(e, bex.ClientError):
         code = e.response.get("Error", {}).get("Code", "")
         summary, hint = AWS_ERROR_HINTS.get(code, (f"AWS がエラーを返しました ({code})。", ""))
@@ -803,10 +804,15 @@ def explain_aws_error(e, profile, bucket):
     else:
         msg = f"AWS への接続でエラーが発生しました: {e}"
         hint = ""
-    lines = [msg, f"  プロファイル: {profile} / バケット: {bucket}"]
-    if hint:
+    lines = [msg, f"  プロファイル: {profile}{' (設定ファイルに profile がないため既定を使用)' if no_profile else ''}"
+                  f" / バケット: {bucket}"]
+    if no_profile:
+        lines.append('対処: 設定ファイルに "profile": "プロファイル名" を追加するか、'
+                     "--profile プロファイル名 を付けて実行してください。")
+    elif hint:
         lines.append("対処: " + hint.format(profile=profile, bucket=bucket))
-    lines.append(f"接続確認: aws sts get-caller-identity --profile {profile}")
+    if not no_profile:
+        lines.append(f"接続確認: aws sts get-caller-identity --profile {profile}")
     return MoveError("\n".join(lines))
 
 
