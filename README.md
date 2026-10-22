@@ -189,24 +189,29 @@ aws sts get-caller-identity --profile dcr_iijima_dev   # 認証が有効か確�
 python s3_move.py search --config config.json --user-id 000002
 python s3_move.py search --config config.json --user-id 000003
 
-# ② 移動対象の一覧を作成 (必要に応じて --status / --since / --until で絞り込み)
+# ② 移動元の結果フォルダを全件表示し、アップロード日を確認 (S3 は変更しない)
+#    一覧の下に「最終アップロード日の範囲」と「月別フォルダ数」が出るので、移動する期間を決める
+python s3_move.py list --config config.json --user-id 000002 --sort last
+
+# ③ 決めた期間で絞り込み、一覧を CSV に保存 (必要に応じて --status checked / unchecked も指定)
 python s3_move.py list --config config.json --user-id 000002 --since 2026-10-01 --until 2026-10-31 -o list_000002.csv
 
-# ③ list_000002.csv を Excel 等で開き、移動しない行を削除して保存
+# ④ list_000002.csv を Excel 等で開き、移動しない行を削除して保存
 
-# ④ ドライラン (S3 は変更しない)。移動先のパスと件数を必ず確認
+# ⑤ ドライラン (S3 は変更しない)。移動先のパスと件数を必ず確認
 python s3_move.py move --config config.json --list list_000002.csv --dst-user-id 000003 --dry-run
 
-# ⑤ 問題なければ実行。画面の指示に従って移動先ユーザーID・Identity ID 末尾 6 文字・yes を入力
+# ⑥ 問題なければ実行。画面の指示に従って移動先ユーザーID・Identity ID 末尾 6 文字・yes を入力
 python s3_move.py move --config config.json --list list_000002.csv --dst-user-id 000003 --execute
 
-# ⑥ 結果を確認 (移動元に残っていないこと、移動先に入ったこと)
+# ⑦ 結果を確認 (移動元に残っていないこと、移動先に入ったこと)
 python s3_move.py list --config config.json --user-id 000002
 python s3_move.py list --config config.json --user-id 000003
 ```
 
+- 期間で絞り込まず全件を対象にする場合は、③ で `--since` / `--until` を付けずに `-o` だけ指定します。
 - 操作ログ（`logs/move_*.json`）とドライランレポート（`logs/dryrun_*.json`）は作業記録として保管してください。
-- 途中でエラーが出た場合、失敗したフォルダの移動元は削除されていません。操作ログで状況を確認し、原因を取り除いてから ② からやり直してください（移動済みのフォルダは移動元に無いため、再度対象になることはありません）。
+- 途中でエラーが出た場合、失敗したフォルダの移動元は削除されていません。操作ログで状況を確認し、原因を取り除いてから ③ からやり直してください（移動済みのフォルダは移動元に無いため、再度対象になることはありません）。
 
 ## トラブルシューティング
 
@@ -267,6 +272,8 @@ python s3_move.py list --config config.json --user-id 000002 --status checked \
      1. checked   SAT0202301              1    1   0     2.3KB  2026-10-22 11:02:23  2026-10-22 11:02:23
 
 1 フォルダ / 2 ファイル / 2.3KB
+最終アップロード日の範囲: 2026-10-22 〜 2026-10-22
+月別フォルダ数 (最終アップロード日): 2026-10: 1
 一覧を保存しました: list.csv
 ```
 
@@ -351,6 +358,7 @@ python s3_move.py move --config config.json --src-user-id 000002 --dst-user-id 0
 | `--since` / `--until` | | ✓ | ✓ | アップロード日の期間（YYYY-MM-DD、両端を含む） |
 | `--date-basis` | | ✓ | ✓ | 期間判定に使う日付 `last`（最終、既定）/ `first`（最初） |
 | `-o`, `--output` | | ✓ | | 一覧を CSV に保存 |
+| `--sort` | | ✓ | | 並び順 `name`（既定）/ `last`（最終アップロード日順）/ `first`（最初のアップロード日順） |
 | `--folder NAME` | | | ✓ | 対象の結果フォルダ名（複数指定可） |
 | `--list FILE` | | | ✓ | 一覧 CSV のフォルダを一括移動（`--folder` / `--since` / `--until` / `--status` とは併用不可） |
 | `--dry-run` | | | ✓ | ドライラン（既定）。S3 を変更せず移動予定ファイルの一覧とレポートを出力 |

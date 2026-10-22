@@ -485,11 +485,36 @@ def cmd_search(args, config, s3, bucket, input_func, out):
     return 0
 
 
+def basis_date(folder, basis, tz):
+    dt = folder.last_uploaded if basis == "last" else folder.first_uploaded
+    return dt.astimezone(tz).date() if dt else None
+
+
+def sort_folders(folders, key):
+    if key == "name":
+        return folders
+    attr = "last_uploaded" if key == "last" else "first_uploaded"
+    return sorted(folders, key=lambda f: getattr(f, attr))
+
+
+def print_date_summary(folders, args, config, out):
+    """期間指定の目安として、アップロード日の範囲と月別のフォルダ数を表示する。"""
+    dates = [basis_date(f, args.date_basis, config["tz"]) for f in folders]
+    basis = "最終アップロード日" if args.date_basis == "last" else "最初のアップロード日"
+    print(f"{basis}の範囲: {min(dates)} 〜 {max(dates)}", file=out)
+    months = {}
+    for d in dates:
+        months[d.strftime("%Y-%m")] = months.get(d.strftime("%Y-%m"), 0) + 1
+    print(f"月別フォルダ数 ({basis}): " +
+          ", ".join(f"{m}: {n}" for m, n in sorted(months.items())), file=out)
+
+
 def cmd_list(args, config, s3, bucket, input_func, out):
     user_id, identity_id = validated_ids(config, args.user_id, args.identity_id)
     owner = resolve_owner(s3, bucket, config, "対象", user_id, identity_id, out)
     statuses = STATUSES if args.status == "both" else (args.status,)
     folders = filter_period(collect_folders(s3, bucket, config, owner, statuses), args, config)
+    folders = sort_folders(folders, args.sort)
 
     print(f"対象     : {owner}", file=out)
     print(f"フォルダ : {', '.join(statuses)}", file=out)
@@ -502,6 +527,9 @@ def cmd_list(args, config, s3, bucket, input_func, out):
     print("", file=out)
     print(f"{len(folders)} フォルダ / {sum(len(f.objects) for f in folders)} ファイル / "
           f"{format_size(sum(f.total_size for f in folders))}", file=out)
+    print_date_summary(folders, args, config, out)
+    if not (args.since or args.until):
+        print("期間で絞り込むには --since YYYY-MM-DD / --until YYYY-MM-DD を付けて実行してください。", file=out)
     if args.output:
         write_list_csv(args.output, owner, folders, config)
         print(f"一覧を保存しました: {args.output}", file=out)
@@ -718,6 +746,9 @@ def parse_args(argv):
     lp.add_argument("--user-id", help="ユーザーID")
     lp.add_argument("--identity-id", help="Identity ID")
     lp.add_argument("--output", "-o", help="一覧を CSV ファイルに保存する")
+    lp.add_argument("--sort", choices=("name", "last", "first"), default="name",
+                    help="並び順: name (状態・フォルダ名順、既定) / last (最終アップロード日順) / "
+                         "first (最初のアップロード日順)")
 
     mp = sub.add_parser("move", parents=[common, period], help="結果フォルダを確認しながら移動")
     mp.add_argument("--src-user-id", help="移動元のユーザーID")

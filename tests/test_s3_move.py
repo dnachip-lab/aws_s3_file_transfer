@@ -385,3 +385,33 @@ def test_aws_error_without_profile_suggests_setting_it(env):
     msg = str(ei.value)
     assert "設定ファイルに profile がないため既定を使用" in msg
     assert '"profile"' in msg and "--profile" in msg
+
+
+def test_list_sort_and_date_summary(env):
+    s3, config, _ = env
+    utc = datetime.timezone.utc
+    dates = {
+        "SAT0202301": datetime.datetime(2026, 9, 5, 3, 0, tzinfo=utc),
+        "SAT0202302": datetime.datetime(2026, 8, 20, 3, 0, tzinfo=utc),
+        "SAT0202303": datetime.datetime(2026, 9, 30, 16, 0, tzinfo=utc),  # JST 2026-10-01
+    }
+    real = s3_move.list_objects
+
+    def fake(s3_, bucket, prefix):
+        objs = real(s3_, bucket, prefix)
+        for o in objs:
+            for name, dt in dates.items():
+                if f"/{name}/" in o["Key"]:
+                    o["LastModified"] = dt
+        return objs
+
+    from unittest import mock
+    with mock.patch.object(s3_move, "list_objects", side_effect=fake):
+        code, out = run(s3, config, ["list", "--user-id", "000002", "--sort", "last"])
+    assert code == 0
+    order = [n for n in ("SAT0202302", "SAT0202301", "SAT0202303")]
+    positions = [out.index(n) for n in order]
+    assert positions == sorted(positions)
+    assert "最終アップロード日の範囲: 2026-08-20 〜 2026-10-01" in out
+    assert "2026-08: 1, 2026-09: 1, 2026-10: 1" in out
+    assert "--since YYYY-MM-DD" in out
