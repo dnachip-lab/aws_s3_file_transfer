@@ -203,6 +203,33 @@ python s3_move.py list --config config.json --user-id 000003
 - 操作ログ（`logs/move_*.json`）とドライランレポート（`logs/dryrun_*.json`）は作業記録として保管してください。
 - 途中でエラーが出た場合、失敗したフォルダの移動元は削除されていません。操作ログで状況を確認し、原因を取り除いてから ② からやり直してください（移動済みのフォルダは移動元に無いため、再度対象になることはありません）。
 
+## トラブルシューティング
+
+AWS のエラーが出た場合、ツールは原因と対処を表示します。まず次のコマンドで認証情報を確認してください。
+
+```bash
+aws sts get-caller-identity --profile dcr_iijima_dev
+aws s3 ls s3://cp-reportsys-620665995161-test150400-test/private/ --profile dcr_iijima_dev
+```
+
+| エラー | 原因 | 対処 |
+| --- | --- | --- |
+| `SignatureDoesNotMatch` | シークレットアクセスキーがアクセスキーID と一致しない | `aws configure --profile dcr_iijima_dev` でキーを入力し直す（コピー時の前後の空白・欠けに注意）。`~/.aws/credentials` の `[dcr_iijima_dev]` が重複していないか確認 |
+| `InvalidAccessKeyId` | アクセスキーID が無効・削除済み | 管理者に有効なキーを発行してもらい、`aws configure` で設定し直す |
+| `ExpiredToken` / SSO のログインが必要 | 一時認証情報・SSO の有効期限切れ | `aws sso login --profile dcr_iijima_dev` |
+| `RequestTimeTooSkewed` | PC の時刻がずれている | PC の時刻を合わせる。WSL の場合は `sudo hwclock -s`、または PowerShell で `wsl --shutdown` して WSL を再起動 |
+| `AccessDenied` | 権限不足 | 初回セットアップ手順 3 の IAM ポリシーが付いているか管理者に確認 |
+| `NoSuchBucket` | バケット名・アカウントの誤り | `config.json` の `bucket` と、使っているプロファイルのアカウントを確認 |
+| プロファイルが見つからない | プロファイル未作成・名前の誤り | `aws configure --profile dcr_iijima_dev` で作成。`config.json` の `profile` を確認 |
+
+`~/.aws/credentials` の正しい形（`[dcr_iijima_dev]` は 1 回だけ、`=` の前後以外に空白を入れない）:
+
+```ini
+[dcr_iijima_dev]
+aws_access_key_id = AKIAXXXXXXXXXXXXXXXX
+aws_secret_access_key = xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
 ## 使い方
 
 ### search: 対象フォルダの検索

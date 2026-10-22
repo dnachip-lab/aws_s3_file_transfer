@@ -755,6 +755,61 @@ def make_client(args, config):
     return session.client("s3", region_name=args.region or config.get("region"))
 
 
+AWS_ERROR_HINTS = {
+    "SignatureDoesNotMatch": (
+        "AWS の認証に失敗しました (シークレットアクセスキーがアクセスキーID と一致しません)。",
+        "aws configure --profile {profile} でアクセスキーID とシークレットアクセスキーを入力し直してください "
+        "(コピー時の前後の空白・欠けに注意)。\n"
+        "~/.aws/credentials の [{profile}] に同じ設定が重複していないかも確認してください。"),
+    "InvalidAccessKeyId": (
+        "AWS の認証に失敗しました (アクセスキーID が存在しないか無効です)。",
+        "aws configure --profile {profile} で正しいアクセスキーを設定してください。"),
+    "InvalidClientTokenId": (
+        "AWS の認証に失敗しました (アクセスキーID が無効です)。",
+        "aws configure --profile {profile} で正しいアクセスキーを設定してください。"),
+    "ExpiredToken": (
+        "AWS の認証情報の有効期限が切れています。",
+        "SSO の場合は aws sso login --profile {profile} を実行してください。"),
+    "RequestTimeTooSkewed": (
+        "PC の時刻が実際の時刻とずれているため、AWS に拒否されました。",
+        "PC の時刻を合わせてください (WSL の場合は sudo hwclock -s、または WSL を再起動: wsl --shutdown)。"),
+    "AccessDenied": (
+        "S3 へのアクセス権限がありません。",
+        "プロファイル {profile} のユーザー / ロールに、バケット {bucket} の private/ 以下への "
+        "s3:ListBucket / GetObject / PutObject / DeleteObject 権限があるか管理者に確認してください。"),
+    "NoSuchBucket": (
+        "バケットが見つかりません。",
+        "設定ファイルの bucket ({bucket}) と、接続先の AWS アカウント (プロファイル {profile}) を確認してください。"),
+}
+
+
+def explain_aws_error(e, profile, bucket):
+    """boto3 / botocore の例外を、原因と対処を書いた MoveError に変換する。"""
+    from botocore import exceptions as bex
+    profile = profile or "(既定)"
+    if isinstance(e, bex.ClientError):
+        code = e.response.get("Error", {}).get("Code", "")
+        summary, hint = AWS_ERROR_HINTS.get(code, (f"AWS がエラーを返しました ({code})。", ""))
+        msg = f"{summary}\n  詳細: {e}"
+    elif isinstance(e, bex.ProfileNotFound):
+        msg = f"AWS プロファイル {profile} が見つかりません。"
+        hint = "aws configure --profile {profile} でプロファイルを作成するか、設定ファイルの profile を確認してください。"
+    elif isinstance(e, (bex.NoCredentialsError, bex.PartialCredentialsError)):
+        msg = "AWS の認証情報が見つかりません。"
+        hint = "aws configure --profile {profile} で認証情報を設定してください。"
+    elif isinstance(e, (bex.SSOError, bex.TokenRetrievalError)):
+        msg = "SSO のログインが必要です。"
+        hint = "aws sso login --profile {profile} を実行してください。"
+    else:
+        msg = f"AWS への接続でエラーが発生しました: {e}"
+        hint = ""
+    lines = [msg, f"  プロファイル: {profile} / バケット: {bucket}"]
+    if hint:
+        lines.append("対処: " + hint.format(profile=profile, bucket=bucket))
+    lines.append(f"接続確認: aws sts get-caller-identity --profile {profile}")
+    return MoveError("\n".join(lines))
+
+
 COMMANDS = {"search": cmd_search, "list": cmd_list, "move": cmd_move}
 
 
@@ -764,8 +819,12 @@ def run(argv=None, s3=None, input_func=input, out=sys.stdout):
     bucket = args.bucket or config.get("bucket")
     if not bucket:
         raise MoveError("バケット名が指定されていません (--bucket または設定ファイルの bucket)")
-    s3 = s3 or make_client(args, config)
-    return COMMANDS[args.command](args, config, s3, bucket, input_func, out)
+    from botocore.exceptions import BotoCoreError, ClientError
+    try:
+        s3 = s3 or make_client(args, config)
+        return COMMANDS[args.command](args, config, s3, bucket, input_func, out)
+    except (BotoCoreError, ClientError) as e:
+        raise explain_aws_error(e, args.profile or config.get("profile"), bucket) from e
 
 
 def main():

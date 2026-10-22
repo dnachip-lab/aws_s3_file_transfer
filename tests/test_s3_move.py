@@ -347,3 +347,27 @@ def test_dry_run_and_execute_are_exclusive(env):
     s3, config, _ = env
     with pytest.raises(SystemExit):
         run(s3, config, BASE + ["--dry-run", "--execute"])
+
+
+def test_aws_error_is_explained(env):
+    s3, config, _ = env
+    from botocore.exceptions import ClientError
+    from unittest import mock
+    err = ClientError({"Error": {"Code": "SignatureDoesNotMatch", "Message": "bad sig"}}, "ListObjectsV2")
+    with mock.patch.object(s3, "get_paginator", side_effect=err):
+        with pytest.raises(s3_move.MoveError) as ei:
+            run(s3, config, ["search", "--user-id", "000002"])
+    msg = str(ei.value)
+    assert "シークレットアクセスキー" in msg
+    assert "aws configure --profile" in msg
+    assert "aws sts get-caller-identity" in msg
+
+
+def test_profile_not_found_is_explained(env, tmp_path):
+    _, config, _ = env
+    cfg = json.loads(open(config).read())
+    cfg["profile"] = "no_such_profile_xyz"
+    path = tmp_path / "c2.json"
+    path.write_text(json.dumps(cfg))
+    with pytest.raises(s3_move.MoveError, match="プロファイル no_such_profile_xyz が見つかりません"):
+        s3_move.run(["search", "--config", str(path), "--user-id", "000002"], out=io.StringIO())
