@@ -36,7 +36,7 @@ search で ID を確認 → list で一覧 CSV を作成 → CSV から不要な
 | 上書き禁止 | 移動先に同名の結果フォルダがあるものは対象外にします。ファイル単位でも既存ファイルがあれば中止します |
 | 一覧 CSV の鮮度チェック | 一覧作成後にファイル数が変わったフォルダ・無くなったフォルダは対象外にします。1 つの CSV に複数の移動元が混在していたら中止します |
 | checked / unchecked は維持 | `checked` は `checked` へ、`unchecked` は `unchecked` へのみ移動します |
-| 段階的な確認 | ① 移動するフォルダを番号で選択（一覧 CSV 指定時は CSV の内容が対象）→ ② 移動先のユーザーID を再入力 → ③ 移動先 Identity ID の末尾 6 文字を入力（どちらも一致しなければ中止）→ ④ `yes` と入力 |
+| 段階的な確認 | ① 移動するフォルダを番号で選択（一覧 CSV 指定時は CSV の内容が対象）→ ② 移動先のユーザーID を再入力 → ③ 移動先 Identity ID の末尾 6 文字（または Identity ID 全体）を入力（どちらも一致しなければ中止）→ ④ `yes` と入力 |
 | コピー → 検証 → 削除 | コピー後にサイズを照合し、フォルダ内の全ファイルが検証できてから移動元を削除します。エラー時はその時点で停止し、失敗したフォルダの移動元は残ります |
 | 操作ログ | コピー・削除した全ファイルを `logs/move_YYYYmmdd_HHMMSS.json` に記録します |
 | 想定外ファイルの警告 | PDF / CSV 以外のファイルを含むフォルダには注意を表示します（PDF / CSV を 1 つも含まないフォルダは移動対象外） |
@@ -207,7 +207,7 @@ python s3_move.py list --config config.json --user-id 000002 --name 'SAT2026*' -
 # ⑤ ドライラン (S3 は変更しない)。移動先のパスと件数を必ず確認
 python s3_move.py move --config config.json --list list_000002.csv --dst-user-id 000003 --dry-run
 
-# ⑥ 問題なければ実行。画面の指示に従って移動先ユーザーID・Identity ID 末尾 6 文字・yes を入力
+# ⑥ 問題なければ実行。画面の指示に従って移動先ユーザーID・Identity ID 末尾 6 文字（または全体）・yes を入力
 python s3_move.py move --config config.json --list list_000002.csv --dst-user-id 000003 --execute
 
 # ⑦ 結果を確認 (移動元に残っていないこと、移動先に入ったこと)
@@ -353,7 +353,7 @@ python s3_move.py move --config config.json --src-user-id 000002 --dst-user-id 0
     ...
 
 確認のため、移動先のユーザーID を入力してください: 000003
-確認のため、移動先の Identity ID の末尾 6 文字を入力してください: abcdef
+確認のため、移動先の Identity ID の末尾 6 文字 (または Identity ID 全体) を入力してください: abcdef
 2 フォルダを移動します。実行してよろしいですか? (yes/no): yes
 移動中 (1/2): [checked] SAT0202301 ... 完了
 移動中 (2/2): [unchecked] SAT0202303 ... 完了

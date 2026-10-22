@@ -479,6 +479,12 @@ def move_folder(s3, bucket, folder, log):
             log.append({"action": "delete", "src": k, "time": now_iso()})
 
 
+def identity_confirmed(typed, identity_id):
+    """確認入力が Identity ID 全体、または末尾 CONFIRM_SUFFIX_LEN 文字と一致するか。"""
+    typed = typed.strip().lower()
+    return typed in (identity_id.lower(), identity_id[-CONFIRM_SUFFIX_LEN:].lower())
+
+
 def now_iso():
     return datetime.datetime.now().isoformat(timespec="seconds")
 
@@ -686,10 +692,17 @@ def cmd_move(args, config, s3, bucket, input_func, out):
         print("移動対象の結果フォルダはありません。", file=out)
         return 0
 
-    print("移動対象の結果フォルダ:", file=out)
-    print_plan(plan, config, out)
-    print("", file=out)
     blocked = [f for f in plan if f.blocked]
+    if entries is not None and args.execute:
+        # 一覧 CSV での実行は番号選択がないため、移動対象は最終確認でだけ表示する
+        if blocked:
+            print("移動できないため対象外になる結果フォルダ:", file=out)
+            print_plan(blocked, config, out)
+            print("", file=out)
+    else:
+        print("移動対象の結果フォルダ:", file=out)
+        print_plan(plan, config, out)
+        print("", file=out)
     if blocked:
         print(f"※ {len(blocked)} フォルダは移動できないため対象外になります。", file=out)
 
@@ -746,9 +759,11 @@ def cmd_move(args, config, s3, bucket, input_func, out):
     if typed.strip() != dst.user_id:
         print("移動先のユーザーID が一致しません。中止しました。", file=out)
         return 1
-    typed = input_func(f"確認のため、移動先の Identity ID の末尾 {CONFIRM_SUFFIX_LEN} 文字を入力してください: ")
-    if typed.strip().lower() != dst.identity_id[-CONFIRM_SUFFIX_LEN:].lower():
-        print("移動先の Identity ID が一致しません。中止しました。", file=out)
+    typed = input_func(f"確認のため、移動先の Identity ID の末尾 {CONFIRM_SUFFIX_LEN} 文字"
+                       f" (または Identity ID 全体) を入力してください: ")
+    if not identity_confirmed(typed, dst.identity_id):
+        print(f"移動先の Identity ID が一致しません (末尾 {CONFIRM_SUFFIX_LEN} 文字、"
+              "または Identity ID 全体を入力してください)。中止しました。", file=out)
         return 1
     answer = input_func(f"{len(targets)} フォルダを移動します。実行してよろしいですか? (yes/no): ")
     if answer.strip().lower() != "yes":

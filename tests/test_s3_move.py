@@ -508,3 +508,30 @@ def test_ambiguous_user_id_lists_candidates(env):
                                  "--dst-identity-id", ID_C, "--dry-run"])
     assert code == 0, out
     assert f"private/{ID_C}/000003/checked/SAT0202301/" in out
+
+
+def test_full_identity_id_accepted_as_confirmation(env):
+    s3, config, _ = env
+    code, out = run(s3, config, BASE + ["--folder", "SAT0202301", "--execute"],
+                    ["all", "000003", ID_B, "yes"])
+    assert code == 0, out
+    assert f"private/{ID_B}/000003/checked/SAT0202301/report.pdf" in keys(s3)
+
+
+def test_partial_identity_id_rejected():
+    assert s3_move.identity_confirmed("abcdef", ID_B)
+    assert s3_move.identity_confirmed(" " + ID_B.upper() + " ", ID_B)
+    assert not s3_move.identity_confirmed("bcdef", ID_B)
+    assert not s3_move.identity_confirmed("ap-northeast-1", ID_B)
+    assert not s3_move.identity_confirmed("", ID_B)
+
+
+def test_bulk_execute_prints_plan_once(env):
+    s3, config, tmp = env
+    path = tmp / "list.csv"
+    run(s3, config, ["list", "--user-id", "000002", "-o", str(path)])
+    code, out = run(s3, config, ["move", "--list", str(path), "--dst-user-id", "000003", "--execute"],
+                    CONFIRM)
+    assert code == 0, out
+    assert out.count("SAT0202301/\n") == 2  # 最終確認の 移動元/移動先 の 1 回分のみ
+    assert "移動できないため対象外になる結果フォルダ:" in out  # SAT0202302 は衝突
