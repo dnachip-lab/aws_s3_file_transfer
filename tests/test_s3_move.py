@@ -155,11 +155,63 @@ def test_unknown_destination_user_aborts(env):
         run(s3, config, ["move", "--src-user-id", "000002", "--dst-user-id", "00003"])
 
 
-def test_missing_destination_folder_aborts(env):
+NEW_DST = ["--dst-identity-id", ID_B, "--dst-user-id", "000099"]
+
+
+def test_missing_destination_dry_run_only_warns(env):
     s3, config, _ = env
-    args = ["move", "--src-user-id", "000002", "--dst-identity-id", ID_B, "--dst-user-id", "000099"]
-    with pytest.raises(s3_move.MoveError, match="移動先の checked / unchecked フォルダが見つかりません"):
-        run(s3, config, args)
+    before = keys(s3)
+    code, out = run(s3, config, ["move", "--src-user-id", "000002"] + NEW_DST + ["--dry-run"])
+    assert code == 0, out
+    assert "移動先の checked / unchecked フォルダが見つかりません" in out
+    assert "この Identity ID 配下の既存ユーザーID: 000003" in out
+    assert "--execute で実行するときに作成するか確認します" in out
+    assert keys(s3) == before
+
+
+def test_missing_destination_declined(env):
+    s3, config, _ = env
+    before = keys(s3)
+    code, out = run(s3, config, ["move", "--src-user-id", "000002"] + NEW_DST + ["--execute"], ["no"])
+    assert code == 1
+    assert "中止しました" in out
+    assert keys(s3) == before
+
+
+def test_missing_destination_created_after_confirmation(env):
+    s3, config, tmp = env
+    code, out = run(s3, config, ["move", "--src-user-id", "000002"] + NEW_DST
+                    + ["--folder", "SAT0202301", "--execute"],
+                    ["yes", "all", "000099", ID_B, "yes"])
+    assert code == 0, out
+    k = keys(s3)
+    assert f"private/{ID_B}/000099/checked/" in k
+    assert f"private/{ID_B}/000099/unchecked/" in k
+    assert f"private/{ID_B}/000099/checked/SAT0202301/report.pdf" in k
+    assert "移動先フォルダを新規作成します" in out
+    log = json.loads((tmp / "logs" / os.listdir(tmp / "logs")[0]).read_text())
+    assert [o["key"] for o in log["operations"] if o["action"] == "create_folder"] == [
+        f"private/{ID_B}/000099/checked/", f"private/{ID_B}/000099/unchecked/"]
+    # 作成後は通常の移動先として扱われる
+    code, out = run(s3, config, ["move", "--src-user-id", "000002"] + NEW_DST + ["--dry-run"])
+    assert "見つかりません" not in out
+
+
+def test_missing_destination_not_created_if_final_confirmation_fails(env):
+    s3, config, _ = env
+    before = keys(s3)
+    code, out = run(s3, config, ["move", "--src-user-id", "000002"] + NEW_DST + ["--execute"],
+                    ["yes", "all", "000099", ID_B, "no"])
+    assert code == 1
+    assert keys(s3) == before
+
+
+def test_missing_identity_folder_is_reported(env):
+    s3, config, _ = env
+    code, out = run(s3, config, ["move", "--src-user-id", "000002", "--dst-identity-id",
+                                 "ap-northeast-1:00000000-0000-0000-0000-000000000000",
+                                 "--dst-user-id", "000003", "--dry-run"])
+    assert "この Identity ID のフォルダも存在しません" in out
 
 
 def test_same_source_and_destination_aborts(env):

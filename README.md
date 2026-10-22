@@ -30,7 +30,8 @@ search で ID を確認 → list で一覧 CSV を作成 → CSV から不要な
 | 仕組み | 内容 |
 | --- | --- |
 | ドライラン | `--dry-run`（または `--execute` を付けない場合）は S3 を変更せず、移動されるファイルを 1 件ずつ「移動元 → 移動先」で表示し、レポート `logs/dryrun_*.json` を保存します |
-| ID の特定と存在チェック | 指定した ID が S3 に無い・一意に決まらない場合は中止します。移動先の `checked` / `unchecked` フォルダがどちらも無い場合も中止します（ID の打ち間違い対策）。新規の移動先へ移すときだけ `--allow-new-destination` を付けます |
+| ID の特定と存在チェック | 指定した ID が S3 に無い・一意に決まらない場合は中止します |
+| 移動先フォルダが無い場合の確認 | 移動先の `checked` / `unchecked` フォルダがどちらも無い場合は警告を表示し、その Identity ID 配下の既存ユーザーID（打ち間違いの確認用）を示したうえで、新規作成するか `yes` / `no` で確認します。作成は最終確認がすべて済んでから行います（ドライランでは作成しません） |
 | Identity ID の形式チェック | `ap-northeast-1:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` の形式でなければ中止します |
 | 同一 ID の拒否 | 移動元と移動先が同じなら中止します |
 | 上書き禁止 | 移動先に同名の結果フォルダがあるものは対象外にします。ファイル単位でも既存ファイルがあれば中止します |
@@ -361,6 +362,22 @@ python s3_move.py move --config config.json --src-user-id 000002 --dst-user-id 0
 2 フォルダの移動が完了しました。
 ```
 
+### 移動先のフォルダが無い場合
+
+移動先ユーザーの `checked` / `unchecked` フォルダがまだ無い場合は、次のように確認します。
+
+```
+※警告: 移動先の checked / unchecked フォルダが見つかりません。
+  移動先: private/ap-northeast-1:1e814f9d-.../test2/
+  この Identity ID 配下の既存ユーザーID: test
+  ID の打ち間違いがないか必ず確認してください。
+移動先の checked / unchecked フォルダを新規作成して移動しますか? (yes/no): yes
+```
+
+- `yes` と答えると、通常どおりフォルダ選択・ユーザーID / Identity ID の確認・`yes` の最終確認に進み、最終確認が済んでから `checked/` と `unchecked/` を作成して移動します。作成したフォルダは操作ログに記録されます。
+- 途中で中止した場合、フォルダは作成されません。
+- ドライランでは作成せず、警告だけを表示します。
+
 ### ID の指定について
 
 - ユーザーID と Identity ID は **どちらか一方だけ指定すれば、もう一方を S3 から特定** します。一意に決まらない場合は中止するので、両方指定してください。
@@ -398,7 +415,7 @@ python s3_move.py move --config config.json --src-user-id 000002 --dst-user-id 0
 | `--list FILE` | | | ✓ | 一覧 CSV のフォルダを一括移動（`--folder` / `--name` / `--since` / `--until` / `--status` とは併用不可） |
 | `--dry-run` | | | ✓ | ドライラン（既定）。S3 を変更せず移動予定ファイルの一覧とレポートを出力 |
 | `--execute` | | | ✓ | 実際に移動する（`--dry-run` とは併用不可） |
-| `--allow-new-destination` | | | ✓ | 移動先のフォルダが存在しなくても続行 |
+| `--allow-new-destination` | | | ✓ | 移動先の `checked` / `unchecked` フォルダが無い場合に、作成の確認を省略して作成する（通常は使わない） |
 
 ### 元に戻すには
 

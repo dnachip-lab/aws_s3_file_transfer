@@ -478,6 +478,31 @@ def move_folder(s3, bucket, folder, log):
             log.append({"action": "delete", "src": k, "time": now_iso()})
 
 
+def print_new_destination_warning(s3, bucket, config, dst, out):
+    """移動先が存在しないとき、打ち間違いに気付けるよう周辺の状況を表示する。"""
+    root = config["root_prefix"]
+    print("※警告: 移動先の checked / unchecked フォルダが見つかりません。", file=out)
+    print(f"  移動先: {owner_prefix(config, dst)}", file=out)
+    users = list_subfolders(s3, bucket, f"{root}{dst.identity_id}/")
+    if users:
+        shown = ", ".join(users[:20]) + (f" ほか {len(users) - 20} 件" if len(users) > 20 else "")
+        print(f"  この Identity ID 配下の既存ユーザーID: {shown}", file=out)
+    else:
+        print("  この Identity ID のフォルダも存在しません。", file=out)
+    print("  ID の打ち間違いがないか必ず確認してください。", file=out)
+
+
+def create_destination_folders(s3, bucket, config, dst):
+    """移動先の checked / unchecked フォルダ (S3 コンソールと同じ空のフォルダオブジェクト) を作成する。"""
+    created = []
+    for st in STATUSES:
+        key = status_prefix(config, dst, st)
+        if not prefix_exists(s3, bucket, key):
+            s3.put_object(Bucket=bucket, Key=key, Body=b"")
+            created.append(key)
+    return created
+
+
 def identity_confirmed(typed, identity_id):
     """確認入力が Identity ID 全体と一致するか (前後の空白・大文字小文字は無視)。"""
     return typed.strip().lower() == identity_id.lower()
@@ -653,14 +678,21 @@ def cmd_move(args, config, s3, bucket, input_func, out):
         raise MoveError("移動元と移動先が同じです")
     if not owner_has_results(s3, bucket, config, src):
         raise MoveError(f"移動元の checked / unchecked フォルダが見つかりません: {owner_prefix(config, src)}")
+    create_dst = False
     if not owner_has_results(s3, bucket, config, dst):
-        if not args.allow_new_destination:
-            raise MoveError(
-                f"移動先の checked / unchecked フォルダが見つかりません: {owner_prefix(config, dst)}\n"
-                "ID の打ち間違いがないか確認してください。新規の移動先が意図どおりであれば "
-                "--allow-new-destination を付けて再実行してください。")
-        print(f"※警告: 移動先のフォルダは存在しません。新規に作成されます: {owner_prefix(config, dst)}",
-              file=out)
+        print_new_destination_warning(s3, bucket, config, dst, out)
+        if not args.execute:
+            print("ドライランのため作成しません。--execute で実行するときに作成するか確認します。", file=out)
+        elif args.allow_new_destination:
+            print("--allow-new-destination が指定されているため、移動時に作成します。", file=out)
+            create_dst = True
+        else:
+            answer = input_func("移動先の checked / unchecked フォルダを新規作成して移動しますか? (yes/no): ")
+            if answer.strip().lower() != "yes":
+                print("中止しました。", file=out)
+                return 1
+            create_dst = True
+        print("", file=out)
 
     # 計画の作成
     if entries is not None:
@@ -749,6 +781,9 @@ def cmd_move(args, config, s3, bucket, input_func, out):
     print(f"  移動先: {dst}", file=out)
     print(f"  件数  : {len(targets)} フォルダ / {sum(len(f.objects) for f in targets)} ファイル / "
           f"{format_size(sum(f.total_size for f in targets))}", file=out)
+    if create_dst:
+        print(f"  ※ 移動先フォルダを新規作成します: "
+              f"{', '.join(status_prefix(config, dst, st) for st in STATUSES)}", file=out)
     print("=" * 70, file=out)
     print_plan(targets, config, out)
     print("", file=out)
@@ -779,6 +814,10 @@ def cmd_move(args, config, s3, bucket, input_func, out):
     failed = None
     done = 0
     try:
+        if create_dst:
+            for key in create_destination_folders(s3, bucket, config, dst):
+                log.append({"action": "create_folder", "key": key, "time": now_iso()})
+                print(f"フォルダを作成しました: {key}", file=out)
         for i, f in enumerate(targets, 1):
             print(f"移動中 ({i}/{len(targets)}): [{f.status}] {f.name} ...", end=" ", file=out, flush=True)
             try:
@@ -855,7 +894,8 @@ def parse_args(argv):
     mp.add_argument("--dst-identity-id", help="移動先の Identity ID")
     mp.add_argument("--list", help="list -o で保存した一覧 CSV に含まれるフォルダを一括移動する")
     mp.add_argument("--allow-new-destination", action="store_true",
-                    help="移動先のフォルダが存在しなくても続行する (通常は使わないこと)")
+                    help="移動先の checked / unchecked フォルダが無い場合に、確認なしで作成する "
+                         "(通常は使わず、実行時の確認で yes と答えること)")
     mode = mp.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true",
                       help="ドライラン: S3 を変更せず、移動されるファイルの一覧とレポートを出力する (既定)")
