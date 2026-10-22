@@ -1,0 +1,10 @@
+{
+  "bucket": "your-bucket-name",
+  "region": "ap-northeast-1",
+  "id_types": {
+    "user_id": "results/users/{id}/{status}/",
+    "identified_id": "results/identified/{id}/{status}/"
+  },
+  "expected_extensions": [".pdf", ".csv"],
+  "log_dir": "logs"
+}
