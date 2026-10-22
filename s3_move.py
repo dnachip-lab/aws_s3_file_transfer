@@ -18,7 +18,7 @@ move の安全方針:
   * 移動先のフォルダが S3 上に存在しなければ中止 (ID の打ち間違い対策)。
   * 移動先に同名の結果フォルダ / 同名ファイルがある場合は上書きせず対象外にする。
   * 一覧 CSV 作成後にファイル数が変わったフォルダは対象外にする。
-  * 実行前に移動計画を表示し、移動先のユーザーID と Identity ID 末尾の再入力、
+  * 実行前に移動計画を表示し、移動先のユーザーID と Identity ID (全体) の再入力、
     "yes" の入力を求める。
   * コピー後にサイズを検証し、フォルダ内の全ファイルの検証が済んでから
     移動元を削除する。
@@ -38,7 +38,6 @@ from dataclasses import dataclass, field
 
 STATUSES = ("checked", "unchecked")
 DELETE_BATCH = 1000
-CONFIRM_SUFFIX_LEN = 6
 DEFAULT_ROOT_PREFIX = "private/"
 DEFAULT_EXTENSIONS = (".pdf", ".csv")
 DEFAULT_UTC_OFFSET_HOURS = 9
@@ -480,9 +479,8 @@ def move_folder(s3, bucket, folder, log):
 
 
 def identity_confirmed(typed, identity_id):
-    """確認入力が Identity ID 全体、または末尾 CONFIRM_SUFFIX_LEN 文字と一致するか。"""
-    typed = typed.strip().lower()
-    return typed in (identity_id.lower(), identity_id[-CONFIRM_SUFFIX_LEN:].lower())
+    """確認入力が Identity ID 全体と一致するか (前後の空白・大文字小文字は無視)。"""
+    return typed.strip().lower() == identity_id.lower()
 
 
 def now_iso():
@@ -759,11 +757,10 @@ def cmd_move(args, config, s3, bucket, input_func, out):
     if typed.strip() != dst.user_id:
         print("移動先のユーザーID が一致しません。中止しました。", file=out)
         return 1
-    typed = input_func(f"確認のため、移動先の Identity ID の末尾 {CONFIRM_SUFFIX_LEN} 文字"
-                       f" (または Identity ID 全体) を入力してください: ")
+    typed = input_func("確認のため、移動先の Identity ID を全体で入力してください"
+                       " (例: ap-northeast-1:xxxxxxxx-...): ")
     if not identity_confirmed(typed, dst.identity_id):
-        print(f"移動先の Identity ID が一致しません (末尾 {CONFIRM_SUFFIX_LEN} 文字、"
-              "または Identity ID 全体を入力してください)。中止しました。", file=out)
+        print("移動先の Identity ID が一致しません。中止しました。", file=out)
         return 1
     answer = input_func(f"{len(targets)} フォルダを移動します。実行してよろしいですか? (yes/no): ")
     if answer.strip().lower() != "yes":

@@ -64,7 +64,7 @@ def run(s3, config, args, answers=()):
 
 
 BASE = ["move", "--src-user-id", "000002", "--dst-user-id", "000003"]
-CONFIRM = ["000003", "abcdef", "yes"]  # ユーザーID, Identity ID 末尾6文字, yes
+CONFIRM = ["000003", ID_B, "yes"]  # ユーザーID, Identity ID 全体, yes
 
 
 def test_dry_run_resolves_identity_and_changes_nothing(env):
@@ -126,7 +126,7 @@ def test_folder_option(env):
 def test_wrong_user_id_confirmation_aborts(env):
     s3, config, _ = env
     before = keys(s3)
-    code, out = run(s3, config, BASE + ["--execute"], ["all", "000004", "abcdef", "yes"])
+    code, out = run(s3, config, BASE + ["--execute"], ["all", "000004", ID_B, "yes"])
     assert code == 1
     assert "ユーザーID が一致しません" in out
     assert keys(s3) == before
@@ -135,7 +135,7 @@ def test_wrong_user_id_confirmation_aborts(env):
 def test_wrong_identity_confirmation_aborts(env):
     s3, config, _ = env
     before = keys(s3)
-    code, out = run(s3, config, BASE + ["--execute"], ["all", "000003", "bb7da0", "yes"])
+    code, out = run(s3, config, BASE + ["--execute"], ["all", "000003", ID_A, "yes"])
     assert code == 1
     assert "Identity ID が一致しません" in out
     assert keys(s3) == before
@@ -144,7 +144,7 @@ def test_wrong_identity_confirmation_aborts(env):
 def test_not_yes_aborts(env):
     s3, config, _ = env
     before = keys(s3)
-    code, _ = run(s3, config, BASE + ["--execute"], ["all", "000003", "abcdef", "y"])
+    code, _ = run(s3, config, BASE + ["--execute"], ["all", "000003", ID_B, "y"])
     assert code == 1
     assert keys(s3) == before
 
@@ -519,9 +519,10 @@ def test_full_identity_id_accepted_as_confirmation(env):
 
 
 def test_partial_identity_id_rejected():
-    assert s3_move.identity_confirmed("abcdef", ID_B)
+    assert s3_move.identity_confirmed(ID_B, ID_B)
     assert s3_move.identity_confirmed(" " + ID_B.upper() + " ", ID_B)
-    assert not s3_move.identity_confirmed("bcdef", ID_B)
+    assert not s3_move.identity_confirmed("abcdef", ID_B)  # 末尾だけは不可
+    assert not s3_move.identity_confirmed(ID_B[:-1], ID_B)
     assert not s3_move.identity_confirmed("ap-northeast-1", ID_B)
     assert not s3_move.identity_confirmed("", ID_B)
 
